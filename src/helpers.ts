@@ -27,7 +27,7 @@ export async function downloadFileAsBase64(
 ): Promise<{ base64: string; mimeType: string } | null> {
   try {
     const file = await ctx.telegram.getFile(fileId);
-    const token = process.env["TELEGRAM_BOT_TOKEN"]!;
+    const token = process.env["BOT_TOKEN"] || process.env["TELEGRAM_BOT_TOKEN"]!;
     const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
     const response = await axios.get(url, { responseType: "arraybuffer" });
     const buffer = Buffer.from(response.data as ArrayBuffer);

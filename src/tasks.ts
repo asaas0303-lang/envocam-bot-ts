@@ -2,7 +2,7 @@ import type { Telegraf } from "telegraf";
 import type { BotContext } from "./types.js";
 import { clientsStore, modelsStore, reportsStore } from "./data/store.js";
 import { analyzeFeedback } from "./ai.js";
-import { logger } from "../lib/logger.js";
+import { logger } from "./lib/logger.js";
 
 const REVIEW_DELAY_MS = 10 * 60 * 60 * 1000;    // 10 soat
 const FOLLOWUP_DELAY_MS = 60 * 60 * 1000;        // 1 soat
