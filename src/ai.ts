@@ -32,7 +32,7 @@ export async function identifyModelFromImages(
 ): Promise<{ status: "matched" | "unclear" | "no_match"; model: string | null }> {
   if (clientImages.length === 0) return { status: "unclear", model: null };
 
-  const content: Anthropic.ContentBlockParam[] = [];
+  const content: Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> = [];
   const modelNames = models.map((m) => m.name);
   const withRefs = models.filter((m) => m.refImages.length > 0);
 
@@ -47,11 +47,6 @@ export async function identifyModelFromImages(
         content.push({ type: "text", text: `Model: ${m.name} — namuna ${i + 1}` });
         content.push(toImageBlock(m.refImages[i]!));
       }
-    }
-    // Namuna rasmlar barqaror prefiks — prompt cache uchun belgilaymiz
-    const last = content[content.length - 1];
-    if (last && last.type === "image") {
-      last.cache_control = { type: "ephemeral" };
     }
   }
 

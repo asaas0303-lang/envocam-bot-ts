@@ -125,12 +125,14 @@ export function registerClientHandlers(bot: Telegraf<BotContext>): void {
     await processIncomingMessage(ctx, msg, from, chatId, businessConnectionId);
   });
 
-  // Business xabarlar — mijozlar do'kon egasining profiliga yozganda keladi
-  // Bu ENG MUHIM handler — oldingi versiyada yo'q edi, shuning uchun bot javob bermadi
-  bot.on("business_message", async (ctx) => {
+  // Business xabarlar — mijozlar do'kon egasining profiliga yozganda keladi.
+  // @telegraf/types@7.1.0 hali business_message update turini bilmaydi, shuning
+  // uchun bot.on("business_message", ...) kabi tipli filtr build'ni buzadi —
+  // shu sababli xom update'ni o'zimiz bot.use() ichida tekshiramiz.
+  bot.use(async (ctx, next) => {
     const update = ctx.update as unknown as Record<string, unknown>;
-    const msg = update.business_message as Record<string, unknown>;
-    if (!msg) return;
+    const msg = update.business_message as Record<string, unknown> | undefined;
+    if (!msg) return next();
 
     const from = msg.from as { id: number; first_name?: string } | undefined;
     if (!from) return;
@@ -145,10 +147,10 @@ export function registerClientHandlers(bot: Telegraf<BotContext>): void {
   });
 
   // Business ulanish o'rnatilganda — do'kon egasining ID'sini saqlaymiz
-  bot.on("business_connection", async (ctx) => {
+  bot.use(async (ctx, next) => {
     const update = ctx.update as unknown as Record<string, unknown>;
     const conn = update.business_connection as Record<string, unknown> | undefined;
-    if (!conn) return;
+    if (!conn) return next();
 
     const user = conn.user as { id: number } | undefined;
     const connId = conn.id as string | undefined;
