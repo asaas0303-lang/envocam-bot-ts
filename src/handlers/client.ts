@@ -112,7 +112,7 @@ export function registerClientHandlers(bot: Telegraf<BotContext>): void {
 
   // Oddiy xabarlar (bot to'g'ridan-to'g'ri suhbati uchun, test/admin uchun)
   bot.on("message", async (ctx) => {
-    const msg = ctx.message as Record<string, unknown>;
+    const msg = ctx.message as unknown as Record<string, unknown>;
     const from = ctx.from;
     if (!from) return;
 
@@ -128,7 +128,7 @@ export function registerClientHandlers(bot: Telegraf<BotContext>): void {
   // Business xabarlar — mijozlar do'kon egasining profiliga yozganda keladi
   // Bu ENG MUHIM handler — oldingi versiyada yo'q edi, shuning uchun bot javob bermadi
   bot.on("business_message", async (ctx) => {
-    const update = ctx.update as Record<string, unknown>;
+    const update = ctx.update as unknown as Record<string, unknown>;
     const msg = update.business_message as Record<string, unknown>;
     if (!msg) return;
 
@@ -146,7 +146,7 @@ export function registerClientHandlers(bot: Telegraf<BotContext>): void {
 
   // Business ulanish o'rnatilganda — do'kon egasining ID'sini saqlaymiz
   bot.on("business_connection", async (ctx) => {
-    const update = ctx.update as Record<string, unknown>;
+    const update = ctx.update as unknown as Record<string, unknown>;
     const conn = update.business_connection as Record<string, unknown> | undefined;
     if (!conn) return;
 
@@ -226,7 +226,7 @@ async function sendMsg(
       chat_id: chatId,
       text,
       business_connection_id: businessConnectionId,
-    } as Record<string, unknown>);
+    } as any);
   } else {
     await ctx.telegram.sendMessage(chatId, text);
   }
@@ -246,7 +246,7 @@ async function sendVideoMsg(
       business_connection_id: businessConnectionId,
     };
     if (caption) payload.caption = caption;
-    await ctx.telegram.callApi("sendVideo", payload);
+    await ctx.telegram.callApi("sendVideo", payload as any);
   } else {
     await ctx.telegram.sendVideo(chatId, fileId, caption ? { caption } : {});
   }
@@ -263,7 +263,7 @@ async function sendVoiceMsg(
       chat_id: chatId,
       voice: fileId,
       business_connection_id: businessConnectionId,
-    } as Record<string, unknown>);
+    } as any);
   } else {
     await ctx.telegram.sendVoice(chatId, fileId);
   }
