@@ -1,10 +1,17 @@
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { randomUUID } from "crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_FILE = path.join(__dirname, "..", "..", "data.json");
+// Railway'da volume ulanganda bu papka doimiy diskka ishora qiladi;
+// bo'lmasa (masalan lokal ishga tushirishda) loyiha papkasiga yoziladi.
+const DATA_DIR = process.env["RAILWAY_VOLUME_MOUNT_PATH"] || path.join(__dirname, "..", "..");
+const DATA_FILE = path.join(DATA_DIR, "data.json");
+
+if (!existsSync(DATA_DIR)) {
+  mkdirSync(DATA_DIR, { recursive: true });
+}
 
 export interface ImageItem {
   file_id: string;

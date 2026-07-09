@@ -36,7 +36,7 @@ registerAdminHandlers(bot);
 registerClientHandlers(bot);
 startBackgroundTasks(bot);
 
-bot.launch().then(() => {
+bot.launch({ dropPendingUpdates: true }).then(() => {
   logger.info("EnvoCam bot started (long polling)");
 }).catch((err) => {
   logger.error({ err }, "Bot launch failed");
