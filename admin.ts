@@ -1,0 +1,650 @@
+import { Telegraf, Markup } from "telegraf";
+import type { BotContext } from "../types.js";
+import { modelsStore, clientsStore, samplesStore, reportsStore, type CameraModel } from "../data/store.js";
+import { isAdmin, downloadFileAsBase64, sleep } from "../helpers.js";
+import { extractTextFromImage, analyzeInsights } from "../ai.js";
+import { sendReportNow } from "../tasks.js";
+import { formatRegionStats, formatGeneralStats } from "../stats.js";
+
+type AdminState =
+  | { step: "idle" }
+  | { step: "awaiting_model_name" }
+  | { step: "adding_content"; modelName: string; category: string }
+  | { step: "broadcast_text" }
+  | { step: "broadcast_confirm"; text: string }
+  | { step: "awaiting_sample_title" }
+  | { step: "awaiting_sample_text"; title: string };
+
+const adminState = new Map<number, AdminState>();
+function getState(uid: number): AdminState { return adminState.get(uid) || { step: "idle" }; }
+function setState(uid: number, s: AdminState): void { adminState.set(uid, s); }
+function clearState(uid: number): void { adminState.set(uid, { step: "idle" }); }
+
+// ─── Kategoriya nomini chiqarish ──────────────────────────────────────────────
+
+const CAT_LABELS: Record<string, string> = {
+  images: "Rasmlar", manual: "Yo'riqnoma", app: "Ilova",
+  video: "Video", review_voice: "Sharh ovoz", review_video: "Sharh video",
+};
+const CAT_INSTRUCTIONS: Record<string, string> = {
+  images: "Rasm yuboring.",
+  manual: "Yo'riqnoma rasmini yuboring (AI matnni o'qib saqlaydi).",
+  app: "Ilova skrinshot rasmini yuboring (AI matnni o'qib saqlaydi).",
+  video: "Video yuboring.",
+  review_voice: "Sharh uchun ovozli xabar yuboring.",
+  review_video: "Sharh uchun video yuboring.",
+};
+
+function getCategoryCount(model: CameraModel | undefined, category: string): number {
+  if (!model) return 0;
+  if (category === "images") return model.images.length;
+  if (category === "manual") return model.manualImages.length;
+  if (category === "app") return model.appScreenshots.length;
+  if (category === "video") return model.videoGuides.length;
+  if (category === "review_voice") return model.reviewVoiceFileId ? 1 : 0;
+  if (category === "review_video") return model.reviewVideoFileId ? 1 : 0;
+  return 0;
+}
+
+function short(text: string | undefined, max = 28): string {
+  if (!text) return "izohsiz";
+  return text.length > max ? text.slice(0, max) + "…" : text;
+}
+
+// ─── Kategoriya ro'yxat menyu ─────────────────────────────────────────────────
+
+function buildCategoryKeyboard(modelName: string, category: string) {
+  const model = modelsStore.getByName(modelName);
+  const buttons: ReturnType<typeof Markup.button.callback>[][] = [];
+
+  if (category === "review_voice" || category === "review_video") {
+    const has = category === "review_voice" ? !!model?.reviewVoiceFileId : !!model?.reviewVideoFileId;
+    if (has) {
+      buttons.push([
+        Markup.button.callback("1. Mavjud material", "admin_noop"),
+        Markup.button.callback("O'chirish", `admin_item_del_${modelName}__${category}__0`),
+      ]);
+    }
+    buttons.push([Markup.button.callback(has ? "Almashtirish" : "Qo'shish", `admin_addto_${modelName}__${category}`)]);
+  } else {
+    const items =
+      category === "images" ? model?.images ?? [] :
+      category === "manual" ? model?.manualImages ?? [] :
+      category === "app" ? model?.appScreenshots ?? [] :
+      category === "video" ? model?.videoGuides ?? [] : [];
+
+    (items as Array<{ caption?: string; extractedText?: string }>).forEach((item, i) => {
+      const label = short(item.caption || item.extractedText, 26);
+      buttons.push([
+        Markup.button.callback(`${i + 1}. ${label}`, "admin_noop"),
+        Markup.button.callback("O'chirish", `admin_item_del_${modelName}__${category}__${i}`),
+      ]);
+    });
+    buttons.push([Markup.button.callback("+ Qo'shish", `admin_addto_${modelName}__${category}`)]);
+  }
+
+  buttons.push([
+    Markup.button.callback("⬅️ Orqaga", `admin_model_${modelName}`),
+  ]);
+  return Markup.inlineKeyboard(buttons);
+}
+
+function categoryMenuText(modelName: string, category: string): string {
+  const model = modelsStore.getByName(modelName);
+  const count = getCategoryCount(model, category);
+  const label = CAT_LABELS[category] ?? category;
+  return `${modelName} — ${label}\nJami: ${count} ta material`;
+}
+
+// ─── Asosiy handler ro'yxati ──────────────────────────────────────────────────
+
+export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
+
+  bot.command("panel", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    clearState(ctx.from.id);
+    await showMainMenu(ctx);
+  });
+
+  bot.command("hisobot", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await sendReportNow(bot, String(ctx.from.id));
+  });
+
+  bot.command("stats", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.reply("Statistika bo'limi:", buildStatsMenu());
+  });
+
+  // ── Statistika ──
+  bot.action("admin_stats", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await ctx.editMessageText("Statistika bo'limi:", buildStatsMenu());
+  });
+
+  bot.action("admin_stats_region", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const clients = clientsStore.getAll();
+    const text = formatRegionStats(clients);
+    await ctx.reply(text, Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+    ]));
+  });
+
+  bot.action("admin_stats_insights", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+
+    // Cache tekshirish (6 soat)
+    const cached = reportsStore.getCachedInsights();
+    const SIX_HOURS = 6 * 60 * 60 * 1000;
+    if (cached && Date.now() - new Date(cached.cachedAt).getTime() < SIX_HOURS) {
+      const ts = new Date(cached.cachedAt).toLocaleString("uz-UZ", { timeZone: "Asia/Tashkent" });
+      await sendChunkedReply(
+        ctx,
+        `${cached.text}\n\nOxirgi yangilanish: ${ts}`,
+        Markup.inlineKeyboard([[Markup.button.callback("Qayta tahlil", "admin_stats_insights_refresh"), Markup.button.callback("⬅️ Orqaga", "admin_stats")]])
+      );
+      return;
+    }
+
+    await ctx.reply("Tahlil qilinmoqda...");
+    await performInsightsAnalysis(ctx);
+  });
+
+  bot.action("admin_stats_insights_refresh", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await ctx.reply("Tahlil qilinmoqda...");
+    await performInsightsAnalysis(ctx);
+  });
+
+  bot.action("admin_stats_general", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const clients = clientsStore.getAll();
+    const text = formatGeneralStats(clients);
+    await ctx.reply(text, Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+    ]));
+  });
+
+  // ── Bosh menyu ──
+  bot.action("admin_models_list", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const models = modelsStore.getAll();
+    if (models.length === 0) {
+      await ctx.editMessageText("Hozircha modellar yo'q.",
+        Markup.inlineKeyboard([[Markup.button.callback("⬅️ Orqaga", "admin_back_main")]]));
+      return;
+    }
+    const buttons = models.map((m) => [Markup.button.callback(m.name, `admin_model_${m.name}`)]);
+    buttons.push([Markup.button.callback("⬅️ Orqaga", "admin_back_main")]);
+    await ctx.editMessageText("Modellar ro'yxati:", Markup.inlineKeyboard(buttons));
+  });
+
+  bot.action("admin_add_model", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    setState(ctx.from.id, { step: "awaiting_model_name" });
+    await ctx.editMessageText("Yangi model nomini yozing:\n(Bekor — /panel)");
+  });
+
+  bot.action("admin_clients_count", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`Mijozlar soni: ${clientsStore.count()}`,
+      Markup.inlineKeyboard([[Markup.button.callback("⬅️ Orqaga", "admin_back_main")]]));
+  });
+
+  bot.action("admin_broadcast", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    setState(ctx.from.id, { step: "broadcast_text" });
+    await ctx.editMessageText("Hammaga yuboriladigan xabarni yozing:\n(Bekor — /panel)");
+  });
+
+  bot.action("admin_samples", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await showSamplesMenu(ctx);
+  });
+
+  bot.action("admin_back_main", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    clearState(ctx.from.id);
+    await showMainMenuEdit(ctx);
+  });
+
+  bot.action("admin_noop", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+  });
+
+  // ── Model menyusi ──
+  bot.action(/^admin_model_(.+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await showModelMenuEdit(ctx, ctx.match[1]);
+  });
+
+  // ── Kategoriya — ro'yxat ko'rinishi ──
+  bot.action(/^admin_cat_([^_].+)__([a-z_]+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    clearState(ctx.from.id);
+    const modelName = ctx.match[1];
+    const category = ctx.match[2];
+    await ctx.editMessageText(
+      categoryMenuText(modelName, category),
+      buildCategoryKeyboard(modelName, category)
+    );
+  });
+
+  // ── Kategoriyaga qo'shish rejimi ──
+  bot.action(/^admin_addto_(.+)__([a-z_]+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const modelName = ctx.match[1];
+    const category = ctx.match[2];
+    setState(ctx.from.id, { step: "adding_content", modelName, category });
+    const label = CAT_LABELS[category] ?? category;
+    const instruction = CAT_INSTRUCTIONS[category] ?? "Material yuboring.";
+    await ctx.editMessageText(
+      `${modelName} — ${label}\n\n${instruction}`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("✅ Tayyor", `admin_catdone_${modelName}__${category}`)],
+        [Markup.button.callback("⬅️ Orqaga", `admin_cat_${modelName}__${category}`)],
+      ])
+    );
+  });
+
+  bot.action(/^admin_catdone_(.+)__([a-z_]+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    clearState(ctx.from.id);
+    const modelName = ctx.match[1];
+    const category = ctx.match[2];
+    await ctx.editMessageText(
+      categoryMenuText(modelName, category),
+      buildCategoryKeyboard(modelName, category)
+    );
+  });
+
+  // ── Material o'chirish — tasdiq ──
+  bot.action(/^admin_item_del_(.+)__([a-z_]+)__(\d+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const modelName = ctx.match[1];
+    const category = ctx.match[2];
+    const idx = ctx.match[3];
+    const label = CAT_LABELS[category] ?? category;
+    await ctx.editMessageText(
+      `${modelName} — ${label}\n${Number(idx) + 1}-materialni o'chirishni tasdiqlaysizmi?`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Ha, o'chirish", `admin_item_confirm_${modelName}__${category}__${idx}`)],
+        [Markup.button.callback("⬅️ Bekor", `admin_cat_${modelName}__${category}`)],
+      ])
+    );
+  });
+
+  // ── Material o'chirish — amalga oshirish ──
+  bot.action(/^admin_item_confirm_(.+)__([a-z_]+)__(\d+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const modelName = ctx.match[1];
+    const category = ctx.match[2];
+    const idx = Number(ctx.match[3]);
+    const model = modelsStore.getByName(modelName);
+
+    if (model) {
+      if (category === "images") model.images.splice(idx, 1);
+      else if (category === "manual") model.manualImages.splice(idx, 1);
+      else if (category === "app") model.appScreenshots.splice(idx, 1);
+      else if (category === "video") model.videoGuides.splice(idx, 1);
+      else if (category === "review_voice") model.reviewVoiceFileId = undefined;
+      else if (category === "review_video") model.reviewVideoFileId = undefined;
+      modelsStore.save(model);
+    }
+
+    await ctx.editMessageText(
+      categoryMenuText(modelName, category),
+      buildCategoryKeyboard(modelName, category)
+    );
+  });
+
+  // ── Model o'chirish ──
+  bot.action(/^admin_delete_model_(.+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const modelName = ctx.match[1];
+    await ctx.editMessageText(
+      `"${modelName}" modelini o'chirishni tasdiqlaysizmi?\nBarcha materiallari ham o'chadi.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Ha, o'chirish", `admin_confirm_delete_${modelName}`)],
+        [Markup.button.callback("⬅️ Bekor", `admin_model_${modelName}`)],
+      ])
+    );
+  });
+
+  bot.action(/^admin_confirm_delete_(.+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    modelsStore.delete(ctx.match[1]);
+    clearState(ctx.from.id);
+    await showMainMenuEdit(ctx);
+  });
+
+  // ── Broadcast ──
+  bot.action("admin_confirm_broadcast", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const state = getState(ctx.from.id);
+    if (state.step !== "broadcast_confirm") return;
+    const { text } = state;
+    clearState(ctx.from.id);
+
+    const clients = clientsStore.getAll();
+    await ctx.editMessageText(`Xabar ${clients.length} ta mijozga yuborilmoqda...`);
+
+    let sent = 0, failed = 0;
+    for (const client of clients) {
+      try {
+        if (client.businessConnectionId) {
+          await ctx.telegram.sendMessage(client.chatId, text, {
+            business_connection_id: client.businessConnectionId,
+          } as Parameters<typeof ctx.telegram.sendMessage>[2]);
+        } else {
+          await ctx.telegram.sendMessage(client.chatId, text);
+        }
+        sent++;
+      } catch { failed++; }
+      await sleep(2000 + Math.random() * 1000);
+    }
+    await ctx.reply(`Broadcast tugadi. Yuborildi: ${sent}, xatolik: ${failed}`);
+  });
+
+  // ── Namuna ──
+  bot.action("admin_sample_add", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    setState(ctx.from.id, { step: "awaiting_sample_title" });
+    await ctx.editMessageText(
+      "Namuna yozishma sarlavhasini kiriting (masalan: \"WiFi ulanish muammosi\"):\n(Bekor — /panel)"
+    );
+  });
+
+  bot.action(/^admin_sample_delete_(.+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    samplesStore.delete(ctx.match[1]);
+    await showSamplesMenu(ctx);
+  });
+
+  bot.action("admin_samples_back", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    clearState(ctx.from.id);
+    await showMainMenuEdit(ctx);
+  });
+
+  // ── Xabar handleri ──
+  bot.on("message", async (ctx, next) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return next();
+    const state = getState(ctx.from.id);
+    const msg = ctx.message;
+
+    // Model nomi
+    if (state.step === "awaiting_model_name" && "text" in msg) {
+      const name = msg.text.trim();
+      if (!name || name.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
+      if (modelsStore.getByName(name)) { await ctx.reply(`"${name}" allaqachon bor. Boshqa nom:`); return; }
+      modelsStore.save({ name, images: [], manualImages: [], appScreenshots: [], videoGuides: [] });
+      clearState(ctx.from.id);
+      await ctx.reply(`"${name}" modeli qo'shildi.`);
+      await showModelMenuNew(ctx, name);
+      return;
+    }
+
+    // Broadcast
+    if (state.step === "broadcast_text" && "text" in msg) {
+      const text = msg.text.trim();
+      if (!text || text.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
+      setState(ctx.from.id, { step: "broadcast_confirm", text });
+      await ctx.reply(
+        `Quyidagi xabar barcha mijozlarga yuboriladi:\n\n${text}\n\nTasdiqlaysizmi?`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("Yuborish", "admin_confirm_broadcast")],
+          [Markup.button.callback("Bekor", "admin_back_main")],
+        ])
+      );
+      return;
+    }
+
+    // Namuna sarlavhasi
+    if (state.step === "awaiting_sample_title" && "text" in msg) {
+      const title = msg.text.trim();
+      if (!title || title.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
+      setState(ctx.from.id, { step: "awaiting_sample_text", title });
+      await ctx.reply(
+        `"${title}" uchun namuna yozishma matnini yuboring.\n\nFormat:\nMijoz: ...\nMen: ...\n\n(Bekor — /panel)`
+      );
+      return;
+    }
+
+    // Namuna matni
+    if (state.step === "awaiting_sample_text" && "text" in msg) {
+      const text = msg.text.trim();
+      if (!text || text.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
+      const { title } = state;
+      samplesStore.add(title, text);
+      clearState(ctx.from.id);
+      await ctx.reply(`Namuna saqlandi. Jami: ${samplesStore.count()} ta.`);
+      await showSamplesMenuNew(ctx);
+      return;
+    }
+
+    // Kontent qo'shish
+    if (state.step === "adding_content") {
+      const { modelName, category } = state;
+      const model = modelsStore.getByName(modelName);
+      if (!model) return next();
+
+      if (category === "images" && "photo" in msg && msg.photo) {
+        const photo = msg.photo[msg.photo.length - 1];
+        model.images.push({ file_id: photo.file_id, caption: msg.caption });
+        modelsStore.save(model);
+        await ctx.reply(`Saqlandi. Jami: ${model.images.length} ta rasm.`);
+        return;
+      }
+
+      if ((category === "manual" || category === "app") && "photo" in msg && msg.photo) {
+        const photo = msg.photo[msg.photo.length - 1];
+        await ctx.reply("Rasm matnini o'qiyapman...");
+        const dl = await downloadFileAsBase64(ctx, photo.file_id);
+        let extractedText = "";
+        if (dl) extractedText = await extractTextFromImage(dl.base64, dl.mimeType);
+        if (category === "manual") {
+          model.manualImages.push({ file_id: photo.file_id, caption: msg.caption, extractedText });
+          modelsStore.save(model);
+          await ctx.reply(`Saqlandi. Jami: ${model.manualImages.length} ta yo'riqnoma.`);
+        } else {
+          model.appScreenshots.push({ file_id: photo.file_id, caption: msg.caption, extractedText });
+          modelsStore.save(model);
+          await ctx.reply(`Saqlandi. Jami: ${model.appScreenshots.length} ta ilova tasviri.`);
+        }
+        return;
+      }
+
+      if (category === "video" && "video" in msg && msg.video) {
+        model.videoGuides.push({ file_id: msg.video.file_id, caption: msg.caption });
+        modelsStore.save(model);
+        await ctx.reply(`Saqlandi. Jami: ${model.videoGuides.length} ta video.`);
+        return;
+      }
+
+      if (category === "review_voice" && "voice" in msg && msg.voice) {
+        model.reviewVoiceFileId = msg.voice.file_id;
+        modelsStore.save(model);
+        await ctx.reply("Sharh ovozi saqlandi.");
+        return;
+      }
+
+      if (category === "review_video" && "video" in msg && msg.video) {
+        model.reviewVideoFileId = msg.video.file_id;
+        modelsStore.save(model);
+        await ctx.reply("Sharh videosi saqlandi.");
+        return;
+      }
+
+      await ctx.reply("Kutilgan turdagi material yuboring.");
+      return;
+    }
+
+    return next();
+  });
+}
+
+// ─── Menyular ─────────────────────────────────────────────────────────────────
+
+function buildStatsMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Joylashuv (viloyatlar)", "admin_stats_region")],
+    [Markup.button.callback("Mijoz istaklari (AI tahlil)", "admin_stats_insights")],
+    [Markup.button.callback("Umumiy statistika", "admin_stats_general")],
+    [Markup.button.callback("⬅️ Asosiy menyu", "admin_back_main")],
+  ]);
+}
+
+async function sendChunkedReply(
+  ctx: BotContext,
+  text: string,
+  keyboard: ReturnType<typeof Markup.inlineKeyboard>
+): Promise<void> {
+  const MAX = 4000;
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > MAX) {
+    let cut = remaining.lastIndexOf("\n", MAX);
+    if (cut < MAX * 0.5) cut = MAX;
+    chunks.push(remaining.slice(0, cut));
+    remaining = remaining.slice(cut).replace(/^\n+/, "");
+  }
+  chunks.push(remaining);
+  for (let i = 0; i < chunks.length; i++) {
+    if (i === chunks.length - 1) {
+      await ctx.reply(chunks[i], keyboard);
+    } else {
+      await ctx.reply(chunks[i]);
+      await sleep(400);
+    }
+  }
+}
+
+async function performInsightsAnalysis(ctx: BotContext): Promise<void> {
+  const clients = clientsStore.getAll();
+  const feedbacks = clients
+    .filter((c) => c.feedback && c.lastModelName)
+    .map((c) => ({
+      modelName: c.lastModelName!,
+      satisfaction: c.feedback!.satisfaction,
+      wishlist: c.feedback!.wishlist,
+      location: c.feedback!.location,
+      purpose: c.feedback!.purpose,
+    }));
+
+  if (feedbacks.length === 0) {
+    await ctx.reply(
+      "Hali so'rovnoma ma'lumotlari to'planmagan.\nVideo yuborilib 3 soat o'tgach so'rovnoma yuboriladi.",
+      Markup.inlineKeyboard([[Markup.button.callback("⬅️ Statistika", "admin_stats")]])
+    );
+    return;
+  }
+
+  const text = await analyzeInsights(feedbacks);
+  reportsStore.setCachedInsights(text);
+  const ts = new Date().toLocaleString("uz-UZ", { timeZone: "Asia/Tashkent" });
+  await sendChunkedReply(
+    ctx,
+    `${text}\n\nTahlil qilingan: ${ts} | Jami so'rovnoma: ${feedbacks.length} ta`,
+    Markup.inlineKeyboard([[Markup.button.callback("Qayta tahlil", "admin_stats_insights_refresh"), Markup.button.callback("⬅️ Orqaga", "admin_stats")]])
+  );
+}
+
+async function showMainMenu(ctx: BotContext): Promise<void> {
+  const total = clientsStore.count();
+  await ctx.reply("Admin panel:", Markup.inlineKeyboard([
+    [Markup.button.callback("Modellar ro'yxati", "admin_models_list"),
+     Markup.button.callback("Yangi model", "admin_add_model")],
+    [Markup.button.callback(`Mijozlar: ${total} ta`, "admin_clients_count"),
+     Markup.button.callback("Hammaga xabar", "admin_broadcast")],
+    [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples")],
+    [Markup.button.callback("Statistika", "admin_stats")],
+  ]));
+}
+
+async function showMainMenuEdit(ctx: BotContext): Promise<void> {
+  const total = clientsStore.count();
+  await ctx.editMessageText("Admin panel:", Markup.inlineKeyboard([
+    [Markup.button.callback("Modellar ro'yxati", "admin_models_list"),
+     Markup.button.callback("Yangi model", "admin_add_model")],
+    [Markup.button.callback(`Mijozlar: ${total} ta`, "admin_clients_count"),
+     Markup.button.callback("Hammaga xabar", "admin_broadcast")],
+    [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples")],
+    [Markup.button.callback("Statistika", "admin_stats")],
+  ]));
+}
+
+function buildModelKeyboard(modelName: string) {
+  const model = modelsStore.getByName(modelName);
+  const c = (cat: string) => getCategoryCount(model, cat);
+  const rv = model?.reviewVoiceFileId ? "bor" : "yo'q";
+  const rvid = model?.reviewVideoFileId ? "bor" : "yo'q";
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(`Rasmlar (${c("images")})`, `admin_cat_${modelName}__images`),
+     Markup.button.callback(`Yo'riqnoma (${c("manual")})`, `admin_cat_${modelName}__manual`)],
+    [Markup.button.callback(`Ilova (${c("app")})`, `admin_cat_${modelName}__app`),
+     Markup.button.callback(`Video (${c("video")})`, `admin_cat_${modelName}__video`)],
+    [Markup.button.callback(`Sharh ovoz: ${rv}`, `admin_cat_${modelName}__review_voice`),
+     Markup.button.callback(`Sharh video: ${rvid}`, `admin_cat_${modelName}__review_video`)],
+    [Markup.button.callback("Modelni o'chirish", `admin_delete_model_${modelName}`),
+     Markup.button.callback("⬅️ Orqaga", "admin_models_list")],
+  ]);
+}
+
+async function showModelMenuEdit(ctx: BotContext, modelName: string): Promise<void> {
+  await ctx.editMessageText(modelName, buildModelKeyboard(modelName));
+}
+
+async function showModelMenuNew(ctx: BotContext, modelName: string): Promise<void> {
+  await ctx.reply(modelName, buildModelKeyboard(modelName));
+}
+
+async function showSamplesMenu(ctx: BotContext): Promise<void> {
+  const samples = samplesStore.getAll();
+  const buttons = samples.map((s) => [
+    Markup.button.callback(short(s.title, 30), "admin_noop"),
+    Markup.button.callback("O'chirish", `admin_sample_delete_${s.id}`),
+  ]);
+  buttons.push([Markup.button.callback("+ Yangi namuna qo'shish", "admin_sample_add")]);
+  buttons.push([Markup.button.callback("⬅️ Orqaga", "admin_samples_back")]);
+  const text = samples.length === 0
+    ? "Namuna yozishmalar yo'q.\n\nNamunalar AI ga o'z uslubingizni o'rgatadi."
+    : `Namuna yozishmalar: ${samples.length} ta`;
+  await ctx.editMessageText(text, Markup.inlineKeyboard(buttons));
+}
+
+async function showSamplesMenuNew(ctx: BotContext): Promise<void> {
+  const samples = samplesStore.getAll();
+  const buttons = samples.map((s) => [
+    Markup.button.callback(short(s.title, 30), "admin_noop"),
+    Markup.button.callback("O'chirish", `admin_sample_delete_${s.id}`),
+  ]);
+  buttons.push([Markup.button.callback("+ Yangi namuna qo'shish", "admin_sample_add")]);
+  buttons.push([Markup.button.callback("⬅️ Orqaga", "admin_samples_back")]);
+  await ctx.reply(`Namuna yozishmalar: ${samples.length} ta`, Markup.inlineKeyboard(buttons));
+}
