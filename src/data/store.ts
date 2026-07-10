@@ -22,12 +22,16 @@ export interface ManualImageItem extends ImageItem {
   extractedText?: string;
 }
 
+export interface TextGuideItem {
+  text: string;
+}
+
 export interface CameraModel {
   name: string;
   images: ImageItem[];
-  manualImages: ManualImageItem[];
   appScreenshots: ManualImageItem[];
-  videoGuides: ImageItem[];
+  videoGuides: ImageItem[];        // Qisqa masofa — kamera WiFi'siga to'g'ridan-to'g'ri ulanish
+  longRangeGuides: TextGuideItem[]; // Uzoq masofa — uy routeri orqali ulanish, matnli yo'riqnoma
   reviewVoiceFileId?: string;
   reviewVideoFileId?: string;
 }
@@ -75,6 +79,8 @@ export interface ClientData {
   lastProcessedMessageId?: number;
   businessConnectionId?: string;
   lastModelName?: string;
+  connectionMethod?: "short" | "long";
+  awaitingConnectionMethod?: boolean;
   lastInteractionDate?: string;
   region?: string;
   feedbackStage?: FeedbackStage;
@@ -111,7 +117,9 @@ function loadDb(): DbShape {
       const raw = readFileSync(DATA_FILE, "utf-8");
       const parsed = JSON.parse(raw) as Partial<DbShape>;
       return {
-        models: parsed.models ?? [],
+        // Eski ma'lumotlarda longRangeGuides maydoni bo'lmasligi mumkin
+        // (avval "Yo'riqnoma" rasm+OCR edi) — bo'sh massiv bilan boshlanadi.
+        models: (parsed.models ?? []).map((m) => ({ ...m, longRangeGuides: m.longRangeGuides ?? [] })),
         clients: parsed.clients ?? [],
         samples: parsed.samples ?? [],
         reports: parsed.reports ?? {},

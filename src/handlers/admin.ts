@@ -23,12 +23,12 @@ function clearState(uid: number): void { adminState.set(uid, { step: "idle" }); 
 // ─── Kategoriya nomini chiqarish ──────────────────────────────────────────────
 
 const CAT_LABELS: Record<string, string> = {
-  images: "Rasmlar", manual: "Yo'riqnoma", app: "Ilova",
-  video: "Video", review_voice: "Sharh ovoz", review_video: "Sharh video",
+  images: "Rasmlar", manual: "Yo'riqnoma (uzoq masofa)", app: "Ilova",
+  video: "Video (qisqa masofa)", review_voice: "Sharh ovoz", review_video: "Sharh video",
 };
 const CAT_INSTRUCTIONS: Record<string, string> = {
   images: "Rasm yuboring.",
-  manual: "Yo'riqnoma rasmini yuboring (AI matnni o'qib saqlaydi).",
+  manual: "Uzoq masofadan ulash yo'riqnomasi matnini yozing. Uzun bo'lsa bir necha xabarga bo'lib yuborishingiz mumkin.",
   app: "Ilova skrinshot rasmini yuboring (AI matnni o'qib saqlaydi).",
   video: "Video yuboring.",
   review_voice: "Sharh uchun ovozli xabar yuboring.",
@@ -38,7 +38,7 @@ const CAT_INSTRUCTIONS: Record<string, string> = {
 function getCategoryCount(model: CameraModel | undefined, category: string): number {
   if (!model) return 0;
   if (category === "images") return model.images.length;
-  if (category === "manual") return model.manualImages.length;
+  if (category === "manual") return model.longRangeGuides.length;
   if (category === "app") return model.appScreenshots.length;
   if (category === "video") return model.videoGuides.length;
   if (category === "review_voice") return model.reviewVoiceFileId ? 1 : 0;
@@ -69,12 +69,12 @@ function buildCategoryKeyboard(modelName: string, category: string) {
   } else {
     const items =
       category === "images" ? model?.images ?? [] :
-      category === "manual" ? model?.manualImages ?? [] :
+      category === "manual" ? model?.longRangeGuides ?? [] :
       category === "app" ? model?.appScreenshots ?? [] :
       category === "video" ? model?.videoGuides ?? [] : [];
 
-    (items as Array<{ caption?: string; extractedText?: string }>).forEach((item, i) => {
-      const label = short(item.caption || item.extractedText, 26);
+    (items as Array<{ caption?: string; extractedText?: string; text?: string }>).forEach((item, i) => {
+      const label = short(item.caption || item.extractedText || item.text, 26);
       buttons.push([
         Markup.button.callback(`${i + 1}. ${label}`, "admin_noop"),
         Markup.button.callback("O'chirish", `admin_item_del_${modelName}__${category}__${i}`),
@@ -303,7 +303,7 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
 
     if (model) {
       if (category === "images") model.images.splice(idx, 1);
-      else if (category === "manual") model.manualImages.splice(idx, 1);
+      else if (category === "manual") model.longRangeGuides.splice(idx, 1);
       else if (category === "app") model.appScreenshots.splice(idx, 1);
       else if (category === "video") model.videoGuides.splice(idx, 1);
       else if (category === "review_voice") model.reviewVoiceFileId = undefined;
@@ -403,7 +403,7 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
       const name = msg.text.trim();
       if (!name || name.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
       if (modelsStore.getByName(name)) { await ctx.reply(`"${name}" allaqachon bor. Boshqa nom:`); return; }
-      modelsStore.save({ name, images: [], manualImages: [], appScreenshots: [], videoGuides: [] });
+      modelsStore.save({ name, images: [], appScreenshots: [], videoGuides: [], longRangeGuides: [] });
       clearState(ctx.from.id);
       await ctx.reply(`"${name}" modeli qo'shildi.`);
       await showModelMenuNew(ctx, name);
@@ -462,21 +462,25 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
         return;
       }
 
-      if ((category === "manual" || category === "app") && "photo" in msg && msg.photo) {
+      if (category === "manual" && "text" in msg && msg.text) {
+        const text = msg.text.trim();
+        if (text) {
+          model.longRangeGuides.push({ text });
+          modelsStore.save(model);
+          await ctx.reply(`Saqlandi. Jami: ${model.longRangeGuides.length} ta uzoq masofa yo'riqnomasi.`);
+        }
+        return;
+      }
+
+      if (category === "app" && "photo" in msg && msg.photo) {
         const photo = msg.photo[msg.photo.length - 1];
         await ctx.reply("Rasm matnini o'qiyapman...");
         const dl = await downloadFileAsBase64(ctx, photo.file_id);
         let extractedText = "";
         if (dl) extractedText = await extractTextFromImage(dl.base64, dl.mimeType);
-        if (category === "manual") {
-          model.manualImages.push({ file_id: photo.file_id, caption: msg.caption, extractedText });
-          modelsStore.save(model);
-          await ctx.reply(`Saqlandi. Jami: ${model.manualImages.length} ta yo'riqnoma.`);
-        } else {
-          model.appScreenshots.push({ file_id: photo.file_id, caption: msg.caption, extractedText });
-          modelsStore.save(model);
-          await ctx.reply(`Saqlandi. Jami: ${model.appScreenshots.length} ta ilova tasviri.`);
-        }
+        model.appScreenshots.push({ file_id: photo.file_id, caption: msg.caption, extractedText });
+        modelsStore.save(model);
+        await ctx.reply(`Saqlandi. Jami: ${model.appScreenshots.length} ta ilova tasviri.`);
         return;
       }
 
@@ -606,9 +610,9 @@ function buildModelKeyboard(modelName: string) {
   const rvid = model?.reviewVideoFileId ? "bor" : "yo'q";
   return Markup.inlineKeyboard([
     [Markup.button.callback(`Rasmlar (${c("images")})`, `admin_cat_${modelName}__images`),
-     Markup.button.callback(`Yo'riqnoma (${c("manual")})`, `admin_cat_${modelName}__manual`)],
+     Markup.button.callback(`Yo'riqnoma-uzoq (${c("manual")})`, `admin_cat_${modelName}__manual`)],
     [Markup.button.callback(`Ilova (${c("app")})`, `admin_cat_${modelName}__app`),
-     Markup.button.callback(`Video (${c("video")})`, `admin_cat_${modelName}__video`)],
+     Markup.button.callback(`Video-qisqa (${c("video")})`, `admin_cat_${modelName}__video`)],
     [Markup.button.callback(`Sharh ovoz: ${rv}`, `admin_cat_${modelName}__review_voice`),
      Markup.button.callback(`Sharh video: ${rvid}`, `admin_cat_${modelName}__review_video`)],
     [Markup.button.callback("Modelni o'chirish", `admin_delete_model_${modelName}`),

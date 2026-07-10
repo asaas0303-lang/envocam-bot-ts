@@ -112,21 +112,32 @@ async function processIncomingMessage(
   }
   if (msg.photo) {
     const photos = msg.photo as Array<{ file_id: string }>;
-    bufferPhoto(ctx, chatId, photos[photos.length - 1].file_id, businessConnectionId);
+    const caption = typeof msg.caption === "string" ? msg.caption : undefined;
+    bufferPhoto(ctx, chatId, photos[photos.length - 1].file_id, businessConnectionId, caption);
     return;
   }
   if (msg.text) {
     const text = msg.text as string;
-    // handleText/handleFeedback ataylab kechikadi (AI javobi + "inson kabi
-    // yozayapti" pauzasi, 15-70 soniyagacha). Telegraf keyingi yangilanishlarni
-    // shu update to'liq tugagach so'raydi, shuning uchun bu ikkalasini
-    // KUTMASDAN ishga tushiramiz — aks holda shu vaqt ichida yozgan boshqa
-    // mijozlarning xabarlari umuman olinmay qoladi. runSerialized shu mijoz
-    // uchun xabarlar ketma-ket (parallel emas) ishlanishini kafolatlaydi.
+    // handleText/handleFeedback/handleConnectionMethodAnswer ataylab kechikadi
+    // (AI javobi + "inson kabi yozayapti" pauzasi, 15-70 soniyagacha). Telegraf
+    // keyingi yangilanishlarni shu update to'liq tugagach so'raydi, shuning
+    // uchun bularni KUTMASDAN ishga tushiramiz — aks holda shu vaqt ichida
+    // yozgan boshqa mijozlarning xabarlari umuman olinmay qoladi. runSerialized
+    // shu mijoz uchun xabarlar ketma-ket (parallel emas) ishlanishini
+    // kafolatlaydi.
     if (client.feedbackStage && client.feedbackStage !== "done") {
       runSerialized(chatId, () =>
         handleFeedback(ctx, client, text, businessConnectionId).catch(async (err) => {
           logger.error({ err, chatId }, "handleFeedback failed");
+          await sendFallbackError(ctx, client, businessConnectionId);
+        })
+      );
+      return;
+    }
+    if (client.awaitingConnectionMethod) {
+      runSerialized(chatId, () =>
+        handleConnectionMethodAnswer(ctx, client, text, businessConnectionId).catch(async (err) => {
+          logger.error({ err, chatId }, "handleConnectionMethodAnswer failed");
           await sendFallbackError(ctx, client, businessConnectionId);
         })
       );
@@ -207,15 +218,23 @@ interface PhotoBuffer {
   timer: ReturnType<typeof setTimeout>;
   ctx: BotContext;
   businessConnectionId?: string;
+  caption?: string;
 }
 
 const photoBuffers = new Map<string, PhotoBuffer>();
 
-function bufferPhoto(ctx: BotContext, chatId: string, fileId: string, businessConnectionId?: string): void {
+function bufferPhoto(
+  ctx: BotContext,
+  chatId: string,
+  fileId: string,
+  businessConnectionId?: string,
+  caption?: string
+): void {
   const existing = photoBuffers.get(chatId);
   if (existing) {
     if (existing.fileIds.length < MAX_CLIENT_PHOTOS) existing.fileIds.push(fileId);
     existing.ctx = ctx;
+    if (caption && !existing.caption) existing.caption = caption;
     clearTimeout(existing.timer);
     existing.timer = setTimeout(() => void flushPhotos(chatId), PHOTO_DEBOUNCE_MS);
   } else {
@@ -223,6 +242,7 @@ function bufferPhoto(ctx: BotContext, chatId: string, fileId: string, businessCo
       fileIds: [fileId],
       ctx,
       businessConnectionId,
+      caption,
       timer: setTimeout(() => void flushPhotos(chatId), PHOTO_DEBOUNCE_MS),
     });
   }
@@ -237,7 +257,7 @@ async function flushPhotos(chatId: string): Promise<void> {
   if (!client) return;
 
   try {
-    await handlePhotos(buf.ctx, client, buf.fileIds, buf.businessConnectionId);
+    await handlePhotos(buf.ctx, client, buf.fileIds, buf.businessConnectionId, buf.caption);
   } catch {
     try {
       const errMsg =
@@ -323,6 +343,148 @@ async function sendVoiceMsg(
   } else {
     await ctx.telegram.sendVoice(chatId, fileId);
   }
+}
+
+// ─── Ulash usuli (qisqa/uzoq masofa) ──────────────────────────────────────────
+
+function connectionMethodQuestion(language: ClientData["language"]): string {
+  return language !== "ru"
+    ? "Kamerani qanday ulamoqchisiz — uzoq masofadanmi (uy WiFi routeri orqali, istalgan joydan ko'rish) yoki qisqa masofadanmi (kamera WiFi'siga to'g'ridan-to'g'ri ulanib)?"
+    : "Как вы хотите подключить камеру — на дальнем расстоянии (через домашний WiFi роутер, просмотр из любой точки) или на близком расстоянии (напрямую к WiFi камеры)?";
+}
+
+function askForCameraPhotoText(language: ClientData["language"]): string {
+  return language !== "ru"
+    ? "Aniqroq yordam bera olishim uchun kamerangiz rasmini yuboring."
+    : "Чтобы помочь точнее — пришлите фото вашей камеры.";
+}
+
+// Qisqa masofa — mavjud video yo'riqnomalarni ketma-ket yuboradi (avvalgi xatti-harakat o'zgarmagan)
+async function sendShortRangeGuide(
+  ctx: BotContext,
+  client: ClientData,
+  businessConnectionId?: string
+): Promise<void> {
+  const chatId = client.chatId;
+  const isUz = client.language !== "ru";
+  const modelName = client.lastModelName ?? "";
+  const model = client.lastModelName ? modelsStore.getByName(client.lastModelName) : undefined;
+
+  if (model && model.videoGuides.length > 0) {
+    const firstCaption = model.videoGuides[0].caption ||
+      (isUz ? `${modelName} kamerasi uchun yo'riqnoma.` : `Руководство для камеры ${modelName}.`);
+    await sendVideoMsg(ctx, chatId, model.videoGuides[0].file_id, firstCaption, businessConnectionId);
+
+    for (let i = 1; i < model.videoGuides.length; i++) {
+      await sleep(1200);
+      const v = model.videoGuides[i];
+      const cap = v.caption || (isUz ? `${modelName} — ${i + 1}-qism` : `${modelName} — часть ${i + 1}`);
+      await sendVideoMsg(ctx, chatId, v.file_id, cap, businessConnectionId);
+    }
+
+    await sleep(1500);
+    const connectMsg = isUz
+      ? "Kamerani ulashga muvaffaq bo'ldingizmi?"
+      : "Вам удалось подключить камеру?";
+    await sendMsg(ctx, chatId, connectMsg, businessConnectionId);
+    addToHistory(client, "assistant", firstCaption + "\n" + connectMsg);
+  } else {
+    const confirmText = isUz
+      ? `${modelName} kamerasi uchun video yo'riqnoma hali yuklanmagan.`
+      : `Видеоруководство для ${modelName} ещё не загружено.`;
+    await sendMsg(ctx, chatId, confirmText, businessConnectionId);
+    addToHistory(client, "assistant", confirmText);
+  }
+
+  client.awaitingConnectionConfirm = true;
+  client.connectionFollowupSentAt = null;
+  client.lastVideoSentAt = new Date().toISOString();
+  clientsStore.save(client);
+}
+
+// Uzoq masofa — video yo'q, AI matnli yo'riqnomaga tayanib savol-javob tarzida yordam beradi.
+// "Ishladimi?" so'rovi va sharh yuborish bosqichi hozircha faqat qisqa masofa uchun ishlaydi.
+async function sendLongRangeIntro(
+  ctx: BotContext,
+  client: ClientData,
+  businessConnectionId?: string
+): Promise<void> {
+  const isUz = client.language !== "ru";
+  const msg = isUz
+    ? "Uzoq masofadan ulash bo'yicha yordam beraman. Kamerangiz ilovada qo'shilganmi, yoki boshidan boshlaylikmi?"
+    : "Помогу подключить камеру на дальнем расстоянии. Камера уже добавлена в приложении, или начнём с начала?";
+  await sendMsg(ctx, client.chatId, msg, businessConnectionId);
+  addToHistory(client, "assistant", msg);
+  clientsStore.save(client);
+}
+
+async function deliverConnectionGuide(
+  ctx: BotContext,
+  client: ClientData,
+  businessConnectionId?: string
+): Promise<void> {
+  if (client.connectionMethod === "short") {
+    await sendShortRangeGuide(ctx, client, businessConnectionId);
+  } else {
+    await sendLongRangeIntro(ctx, client, businessConnectionId);
+  }
+}
+
+// Mijoz "kamerani ulashga yordam bering" desa (model va/yoki usul hali noma'lum bo'lishi mumkin)
+async function handleConnectCameraRequest(
+  ctx: BotContext,
+  client: ClientData,
+  businessConnectionId?: string
+): Promise<void> {
+  const chatId = client.chatId;
+
+  if (!client.connectionMethod) {
+    client.awaitingConnectionMethod = true;
+    clientsStore.save(client);
+    await sendMsg(ctx, chatId, connectionMethodQuestion(client.language), businessConnectionId);
+    return;
+  }
+
+  if (!client.lastModelName) {
+    if (!client.askedForPhotoOnce) {
+      client.askedForPhotoOnce = true;
+      clientsStore.save(client);
+      await sendMsg(ctx, chatId, askForCameraPhotoText(client.language), businessConnectionId);
+    }
+    return;
+  }
+
+  await deliverConnectionGuide(ctx, client, businessConnectionId);
+}
+
+// "awaitingConnectionMethod" holatida kelgan javobni (qisqa/uzoq) tekshiradi
+async function handleConnectionMethodAnswer(
+  ctx: BotContext,
+  client: ClientData,
+  text: string,
+  businessConnectionId?: string
+): Promise<void> {
+  const { connectionMethod } = await detectIntent(text);
+
+  if (!connectionMethod) {
+    await sendMsg(ctx, client.chatId, connectionMethodQuestion(client.language), businessConnectionId);
+    return;
+  }
+
+  client.connectionMethod = connectionMethod;
+  client.awaitingConnectionMethod = false;
+  clientsStore.save(client);
+
+  if (!client.lastModelName) {
+    if (!client.askedForPhotoOnce) {
+      client.askedForPhotoOnce = true;
+      clientsStore.save(client);
+      await sendMsg(ctx, client.chatId, askForCameraPhotoText(client.language), businessConnectionId);
+    }
+    return;
+  }
+
+  await deliverConnectionGuide(ctx, client, businessConnectionId);
 }
 
 // ─── Feedback javoblari ───────────────────────────────────────────────────────
@@ -411,7 +573,8 @@ async function handlePhotos(
   ctx: BotContext,
   client: ClientData,
   fileIds: string[],
-  businessConnectionId?: string
+  businessConnectionId?: string,
+  caption?: string
 ): Promise<void> {
   const chatId = client.chatId;
   const models = modelsStore.getAll();
@@ -435,6 +598,16 @@ async function handlePhotos(
     return;
   }
 
+  // Rasm bilan birga izoh (caption) kelgan bo'lsa, undan ulash usulini
+  // aniqlashga harakat qilamiz — mijozga qayta so'ramaslik uchun.
+  if (caption && !client.connectionMethod) {
+    const { connectionMethod } = await detectIntent(caption);
+    if (connectionMethod) {
+      client.connectionMethod = connectionMethod;
+      clientsStore.save(client);
+    }
+  }
+
   const modelRefs = [];
   for (const m of models) {
     modelRefs.push({ name: m.name, refImages: await getModelRefImages(ctx, m) });
@@ -446,43 +619,18 @@ async function handlePhotos(
   client = clientsStore.getById(client.chatId) ?? client;
 
   if (result.status === "matched" && result.model) {
-    const model = modelsStore.getByName(result.model);
     client.lastModelName = result.model;
     client.hasGreeted = true;
     client.lastInteractionDate = todayStr();
-
-    const isUz = client.language !== "ru";
-
-    if (model && model.videoGuides.length > 0) {
-      const firstCaption = model.videoGuides[0].caption ||
-        (isUz ? `${result.model} kamerasi uchun yo'riqnoma.` : `Руководство для камеры ${result.model}.`);
-      await sendVideoMsg(ctx, chatId, model.videoGuides[0].file_id, firstCaption, businessConnectionId);
-
-      for (let i = 1; i < model.videoGuides.length; i++) {
-        await sleep(1200);
-        const v = model.videoGuides[i];
-        const cap = v.caption || (isUz ? `${result.model} — ${i + 1}-qism` : `${result.model} — часть ${i + 1}`);
-        await sendVideoMsg(ctx, chatId, v.file_id, cap, businessConnectionId);
-      }
-
-      await sleep(1500);
-      const connectMsg = isUz
-        ? "Kamerani ulashga muvaffaq bo'ldingizmi?"
-        : "Вам удалось подключить камеру?";
-      await sendMsg(ctx, chatId, connectMsg, businessConnectionId);
-      addToHistory(client, "assistant", firstCaption + "\n" + connectMsg);
-    } else {
-      const confirmText = isUz
-        ? `${result.model} kamerasi uchun video yo'riqnoma hali yuklanmagan.`
-        : `Видеоруководство для ${result.model} ещё не загружено.`;
-      await sendMsg(ctx, chatId, confirmText, businessConnectionId);
-      addToHistory(client, "assistant", confirmText);
-    }
-
-    client.awaitingConnectionConfirm = true;
-    client.connectionFollowupSentAt = null;
-    client.lastVideoSentAt = new Date().toISOString();
     clientsStore.save(client);
+
+    if (!client.connectionMethod) {
+      client.awaitingConnectionMethod = true;
+      clientsStore.save(client);
+      await sendMsg(ctx, chatId, connectionMethodQuestion(client.language), businessConnectionId);
+    } else {
+      await deliverConnectionGuide(ctx, client, businessConnectionId);
+    }
 
   } else if (result.status === "unclear") {
     if (!client.askedForPhotoOnce) {
@@ -515,7 +663,12 @@ async function handleText(
     client.language = detectLanguage(text);
   }
 
-  const intent = await detectIntent(text);
+  const { intent, connectionMethod } = await detectIntent(text);
+
+  if (connectionMethod && !client.connectionMethod) {
+    client.connectionMethod = connectionMethod;
+    clientsStore.save(client);
+  }
 
   if (intent === "greeting") {
     const greetBack = shouldGreetBack(client);
@@ -525,6 +678,7 @@ async function handleText(
         question: text,
         language: client.language,
         cameraModel: client.lastModelName ? modelsStore.getByName(client.lastModelName) : undefined,
+        connectionMethod: client.connectionMethod,
         firstName: client.firstName,
         shouldGreet: true,
         history: client.messageHistory || [],
@@ -583,6 +737,15 @@ async function handleText(
     return;
   }
 
+  if (intent === "connect_camera") {
+    addToHistory(client, "user", text);
+    client.hasGreeted = true;
+    client.lastInteractionDate = todayStr();
+    clientsStore.save(client);
+    await handleConnectCameraRequest(ctx, client, businessConnectionId);
+    return;
+  }
+
   const cameraModel = client.lastModelName ? modelsStore.getByName(client.lastModelName) : undefined;
   const samples = samplesStore.getAll().map((s) => s.text);
 
@@ -592,6 +755,7 @@ async function handleText(
     question: text,
     language: client.language,
     cameraModel,
+    connectionMethod: client.connectionMethod,
     firstName: client.firstName,
     shouldGreet: false,
     history: client.messageHistory || [],
@@ -613,12 +777,7 @@ async function handleText(
   if (!cameraModel && !client.askedForPhotoOnce) {
     client.askedForPhotoOnce = true;
     clientsStore.save(client);
-    await sendMsg(ctx, chatId,
-      client.language !== "ru"
-        ? "Aniqroq yordam bera olishim uchun kamerangiz rasmini yuboring."
-        : "Чтобы помочь точнее — пришлите фото вашей камеры.",
-      businessConnectionId
-    );
+    await sendMsg(ctx, chatId, askForCameraPhotoText(client.language), businessConnectionId);
   }
 }
 

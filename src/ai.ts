@@ -87,37 +87,54 @@ Faqat JSON qaytar: {"status": "matched|unclear|no_match", "model": "nom yoki nul
 
 // ─── Niyat aniqlash ───────────────────────────────────────────────────────────
 
-export async function detectIntent(
-  text: string
-): Promise<"greeting" | "gratitude" | "question" | "cannot_send_photo"> {
+export interface IntentResult {
+  intent: "greeting" | "gratitude" | "question" | "cannot_send_photo" | "connect_camera";
+  connectionMethod: "short" | "long" | null;
+}
+
+export async function detectIntent(text: string): Promise<IntentResult> {
   const response = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 64,
+    max_tokens: 96,
     messages: [
       {
         role: "user",
-        content: `Faqat JSON: {"intent": "greeting|gratitude|question|cannot_send_photo"}
+        content: `Faqat JSON qaytar: {"intent": "greeting|gratitude|question|cannot_send_photo|connect_camera", "connectionMethod": "short|long|null"}
+
+INTENT (bittasini tanla):
 - greeting: salom, assalomu alaykum, hi, hello, privjet, zdravstvujte
 - gratitude: rahmat, xo'p, ok, yaxshi, bo'ldi, ishladi, uladim, barakalla, zo'r, spasibo
 - cannot_send_photo: rasm yubora olmayotganini aytmoqda
-- question: savol, muammo, biror narsa so'rash
+- connect_camera: kamerani ulash/sozlashda yordam so'ramoqda (masalan: "kamerani qanday ulashman", "ulashga yordam bering", "sozlab bera olasizmi")
+- question: yuqoridagilarga to'g'ri kelmaydigan boshqa har qanday savol yoki muammo
+
+CONNECTION METHOD — faqat xabarda ANIQ tilga olingan bo'lsa ko'rsat, aks holda null:
+- "short": qisqa masofa, kamera WiFi'siga to'g'ridan-to'g'ri ulanish, yaqin masofadan
+- "long": uzoq masofa, uy/router WiFi'si orqali, istalgan joydan (uzoqdan) ko'rish
 
 Xabar: "${text}"`,
       },
     ],
   });
 
+  const fallback: IntentResult = { intent: "question", connectionMethod: null };
   const block = response.content[0];
-  if (block.type !== "text") return "question";
+  if (block.type !== "text") return fallback;
   try {
     const jsonMatch = block.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return "question";
-    const parsed = JSON.parse(jsonMatch[0]) as { intent: string };
-    const i = parsed.intent;
-    if (i === "greeting" || i === "gratitude" || i === "cannot_send_photo") return i;
-    return "question";
+    if (!jsonMatch) return fallback;
+    const parsed = JSON.parse(jsonMatch[0]) as { intent?: string; connectionMethod?: string | null };
+    const validIntents = ["greeting", "gratitude", "cannot_send_photo", "connect_camera", "question"];
+    const intent = validIntents.includes(parsed.intent ?? "")
+      ? (parsed.intent as IntentResult["intent"])
+      : "question";
+    const connectionMethod =
+      parsed.connectionMethod === "short" || parsed.connectionMethod === "long"
+        ? parsed.connectionMethod
+        : null;
+    return { intent, connectionMethod };
   } catch {
-    return "question";
+    return fallback;
   }
 }
 
@@ -160,6 +177,7 @@ export interface AnswerOptions {
   question: string;
   language: "uz" | "uz-cyrl" | "ru";
   cameraModel: CameraModel | undefined;
+  connectionMethod?: "short" | "long"; // aniqlangan bo'lsa: uzoq/qisqa masofa
   firstName?: string;
   shouldGreet: boolean;       // bu xabarda salom berish kerakmi
   history: MessageRecord[];   // oldingi xabarlar
@@ -167,16 +185,16 @@ export interface AnswerOptions {
 }
 
 export async function answerQuestion(opts: AnswerOptions): Promise<string> {
-  const { question, language, cameraModel, firstName, shouldGreet, history, samples } = opts;
+  const { question, language, cameraModel, connectionMethod, firstName, shouldGreet, history, samples } = opts;
 
   // ─ Bilim bazasi ─
   const knowledgeBase: string[] = [];
   if (cameraModel) {
-    const manualTexts = cameraModel.manualImages
-      .filter((m) => m.extractedText?.trim())
-      .map((m) => m.extractedText as string);
-    if (manualTexts.length > 0)
-      knowledgeBase.push("=== Kamera yo'riqnomasi ===\n" + manualTexts.join("\n\n"));
+    const longRangeTexts = cameraModel.longRangeGuides
+      .map((g) => g.text)
+      .filter((t) => t.trim());
+    if (longRangeTexts.length > 0)
+      knowledgeBase.push("=== Uzoq masofadan ulash yo'riqnomasi ===\n" + longRangeTexts.join("\n\n"));
 
     const appTexts = cameraModel.appScreenshots
       .filter((a) => a.extractedText?.trim())
@@ -215,6 +233,18 @@ export async function answerQuestion(opts: AnswerOptions): Promise<string> {
       : `Не здоровайся. Сразу отвечай на вопрос.`;
   }
 
+  // ─ Ulash usuli ko'rsatmasi ─
+  let connectionMethodNote = "";
+  if (connectionMethod === "long") {
+    connectionMethodNote = isUz
+      ? "\nMijoz kamerani UZOQ MASOFADAN (uy WiFi routeri orqali, istalgan joydan) ulamoqchi. Yuqoridagi \"Uzoq masofadan ulash yo'riqnomasi\"dan foydalanib, bosqichma-bosqich, aniq savol-javob tarzida yordam bering — butun matnni bir yo'la tashlamang, mijoz qayerda qolganini so'rab-bilib boring."
+      : "\nКлиент хочет подключить камеру НА ДАЛЬНЕМ РАССТОЯНИИ (через домашний WiFi роутер, просмотр из любой точки). Используй руководство выше, помогай пошагово, конкретными вопросами и ответами — не выкладывай весь текст сразу.";
+  } else if (connectionMethod === "short") {
+    connectionMethodNote = isUz
+      ? "\nMijoz kamerani QISQA MASOFADAN ulayapti (video yo'riqnoma allaqachon yuborilgan). Savollari bo'lsa video asosida yordam bering."
+      : "\nКлиент подключает камеру НА БЛИЗКОМ РАССТОЯНИИ (видеоинструкция уже отправлена). Помогай по вопросам на основе видео.";
+  }
+
   // ─ System prompt ─
   const systemPrompt = isUz
     ? `Sen EnvoCam kamera do'konining do'stona va samimiy yordamchisisan.
@@ -234,6 +264,7 @@ ${knowledgeBase.length > 0
       : cameraModel
         ? "\nBu kamera uchun hali batafsil ma'lumot yuklanmagan. Umumiy kamera bilimingdan yordam ber."
         : "\nHozircha kamera aniqlanmagan. Umumiy yordam ber va kamera rasmini so'ra."}
+${connectionMethodNote}
 ${samples.length > 0
       ? "\n\n=== Namuna yozishmalar (shu uslubda gapir) ===\n" + samples.join("\n\n---\n\n")
       : ""}`
@@ -252,6 +283,7 @@ ${cameraModel ? `\nМодель камеры: ${cameraModel.name}` : "\nМоде
 ${knowledgeBase.length > 0
       ? "\nСохранённые данные:\n" + knowledgeBase.join("\n\n")
       : "\nПодробных данных пока нет. Помогай на основе общих знаний."}
+${connectionMethodNote}
 ${samples.length > 0
       ? "\n\n=== Примеры общения (придерживайся этого стиля) ===\n" + samples.join("\n\n---\n\n")
       : ""}`;
