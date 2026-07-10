@@ -88,7 +88,7 @@ Faqat JSON qaytar: {"status": "matched|unclear|no_match", "model": "nom yoki nul
 // ─── Niyat aniqlash ───────────────────────────────────────────────────────────
 
 export interface IntentResult {
-  intent: "greeting" | "gratitude" | "question" | "cannot_send_photo" | "connect_camera";
+  intent: "greeting" | "gratitude" | "question" | "cannot_send_photo" | "connect_camera" | "refund_request";
   connectionMethod: "short" | "long" | null;
 }
 
@@ -99,13 +99,14 @@ export async function detectIntent(text: string): Promise<IntentResult> {
     messages: [
       {
         role: "user",
-        content: `Faqat JSON qaytar: {"intent": "greeting|gratitude|question|cannot_send_photo|connect_camera", "connectionMethod": "short|long|null"}
+        content: `Faqat JSON qaytar: {"intent": "greeting|gratitude|question|cannot_send_photo|connect_camera|refund_request", "connectionMethod": "short|long|null"}
 
 INTENT (bittasini tanla):
 - greeting: salom, assalomu alaykum, hi, hello, privjet, zdravstvujte
 - gratitude: rahmat, xo'p, ok, yaxshi, bo'ldi, ishladi, uladim, barakalla, zo'r, spasibo
 - cannot_send_photo: rasm yubora olmayotganini aytmoqda
 - connect_camera: kamerani ulash/sozlashda yordam so'ramoqda (masalan: "kamerani qanday ulashman", "ulashga yordam bering", "sozlab bera olasizmi")
+- refund_request: pulini yoki mahsulotni qaytarib berishni so'ramoqda (masalan: "pulimni qaytaring", "mahsulotni qaytarmoqchiman", "refund", "vozvrat")
 - question: yuqoridagilarga to'g'ri kelmaydigan boshqa har qanday savol yoki muammo
 
 CONNECTION METHOD — faqat xabarda ANIQ tilga olingan bo'lsa ko'rsat, aks holda null:
@@ -124,7 +125,7 @@ Xabar: "${text}"`,
     const jsonMatch = block.text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return fallback;
     const parsed = JSON.parse(jsonMatch[0]) as { intent?: string; connectionMethod?: string | null };
-    const validIntents = ["greeting", "gratitude", "cannot_send_photo", "connect_camera", "question"];
+    const validIntents = ["greeting", "gratitude", "cannot_send_photo", "connect_camera", "refund_request", "question"];
     const intent = validIntents.includes(parsed.intent ?? "")
       ? (parsed.intent as IntentResult["intent"])
       : "question";
@@ -178,6 +179,7 @@ export interface AnswerOptions {
   language: "uz" | "uz-cyrl" | "ru";
   cameraModel: CameraModel | undefined;
   connectionMethod?: "short" | "long"; // aniqlangan bo'lsa: uzoq/qisqa masofa
+  refundRequested?: boolean;  // mijoz pul/mahsulot qaytarishni so'ragan (shu yoki oldingi xabarda)
   firstName?: string;
   shouldGreet: boolean;       // bu xabarda salom berish kerakmi
   history: MessageRecord[];   // oldingi xabarlar
@@ -185,7 +187,7 @@ export interface AnswerOptions {
 }
 
 export async function answerQuestion(opts: AnswerOptions): Promise<string> {
-  const { question, language, cameraModel, connectionMethod, firstName, shouldGreet, history, samples } = opts;
+  const { question, language, cameraModel, connectionMethod, refundRequested, firstName, shouldGreet, history, samples } = opts;
 
   // ─ Bilim bazasi ─
   const knowledgeBase: string[] = [];
@@ -245,6 +247,13 @@ export async function answerQuestion(opts: AnswerOptions): Promise<string> {
       : "\nКлиент подключает камеру НА БЛИЗКОМ РАССТОЯНИИ (видеоинструкция уже отправлена). Помогай по вопросам на основе видео.";
   }
 
+  // ─ Qaytarish (refund) siyosati ─
+  const refundNote = refundRequested
+    ? (isUz
+      ? "\nMUHIM — QAYTARISH SIYOSATI: Mijoz pul yoki mahsulotni qaytarishni so'ragan (shu yoki oldingi xabarda). HECH QACHON pul qaytarish yoki mahsulotni qaytarib olishga rozi bo'lmang va va'da bermang — bu elektronika, hech qanday holatda qaytarilmaydi. Lekin buni DOIM iliq, tushunish bilan va kechirim so'rab ayting, qo'pol yoki sovuq bo'lmang. Muammosini diqqat bilan tinglang va uni birga hal qilishni taklif qiling (masalan sozlash bosqichlarini qaytadan ko'rib chiqish)."
+      : "\nВАЖНО — ПОЛИТИКА ВОЗВРАТА: Клиент попросил вернуть деньги или товар (в этом или предыдущем сообщении). НИКОГДА не соглашайся на возврат и не обещай его — это электроника, возврат невозможен ни при каких условиях. Но говори об этом ВСЕГДА тепло, с пониманием и извинением, не грубо и не холодно. Внимательно выслушай проблему и предложи решить её вместе (например, ещё раз пройти шаги настройки).")
+    : "";
+
   // ─ System prompt ─
   const systemPrompt = isUz
     ? `Sen EnvoCam kamera do'konining do'stona va samimiy yordamchisisan.
@@ -265,6 +274,7 @@ ${knowledgeBase.length > 0
         ? "\nBu kamera uchun hali batafsil ma'lumot yuklanmagan. Umumiy kamera bilimingdan yordam ber."
         : "\nHozircha kamera aniqlanmagan. Umumiy yordam ber va kamera rasmini so'ra."}
 ${connectionMethodNote}
+${refundNote}
 ${samples.length > 0
       ? "\n\n=== Namuna yozishmalar (shu uslubda gapir) ===\n" + samples.join("\n\n---\n\n")
       : ""}`
@@ -284,6 +294,7 @@ ${knowledgeBase.length > 0
       ? "\nСохранённые данные:\n" + knowledgeBase.join("\n\n")
       : "\nПодробных данных пока нет. Помогай на основе общих знаний."}
 ${connectionMethodNote}
+${refundNote}
 ${samples.length > 0
       ? "\n\n=== Примеры общения (придерживайся этого стиля) ===\n" + samples.join("\n\n---\n\n")
       : ""}`;

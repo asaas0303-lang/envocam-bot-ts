@@ -151,6 +151,25 @@ async function processIncomingMessage(
     );
     return;
   }
+
+  // Boshqa turdagi xabar (stiker, GIF, hujjat va h.k.) — yuqoridagi
+  // hech biriga mos kelmadi, aks holda javobsiz qolib ketardi.
+  if (!client.hasGreeted) {
+    // Mijozning birinchi murojaati — xuddi "salom" yozgandek qabul qilamiz.
+    runSerialized(chatId, () =>
+      handleFirstContactNonText(ctx, client, businessConnectionId).catch(async (err) => {
+        logger.error({ err, chatId }, "handleFirstContactNonText failed");
+        await sendFallbackError(ctx, client, businessConnectionId);
+      })
+    );
+    return;
+  }
+
+  runSerialized(chatId, () =>
+    handleUnsupportedMessage(ctx, client, businessConnectionId).catch((err) => {
+      logger.error({ err, chatId }, "handleUnsupportedMessage failed");
+    })
+  );
 }
 
 // ─── Handler ro'yxatga olish ──────────────────────────────────────────────────
@@ -567,6 +586,63 @@ async function handleVoice(
   await sendMsg(ctx, client.chatId, reply, businessConnectionId);
 }
 
+// ─── Boshqa turdagi xabar (stiker, GIF, hujjat va h.k.) ───────────────────────
+
+// Mijozning ENG BIRINCHI murojaati stiker/GIF kabi narsa bo'lsa — xuddi
+// "salom" yozgandek qabul qilib, iliq salomlashamiz va kamera rasmini so'raymiz.
+async function handleFirstContactNonText(
+  ctx: BotContext,
+  client: ClientData,
+  businessConnectionId?: string
+): Promise<void> {
+  const samples = samplesStore.getAll().map((s) => s.text);
+  const reply = await answerQuestion({
+    question: "Salom",
+    language: client.language,
+    cameraModel: undefined,
+    connectionMethod: client.connectionMethod,
+    refundRequested: client.refundRequested,
+    firstName: client.firstName,
+    shouldGreet: true,
+    history: client.messageHistory || [],
+    samples,
+  });
+
+  addToHistory(client, "assistant", reply);
+  client.hasGreeted = true;
+  client.lastInteractionDate = todayStr();
+  clientsStore.save(client);
+
+  const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
+  for (const part of parts) {
+    await sendMsg(ctx, client.chatId, part, businessConnectionId);
+    if (parts.length > 1) await sleep(800);
+  }
+
+  if (!client.askedForPhotoOnce) {
+    client.askedForPhotoOnce = true;
+    clientsStore.save(client);
+    await sleep(800);
+    await sendMsg(ctx, client.chatId, askForCameraPhotoText(client.language), businessConnectionId);
+  }
+}
+
+// Suhbat davomida (birinchi murojaat emas) kelgan stiker/GIF va h.k. uchun —
+// bir martagina, matn bilan yozishni so'rab qo'yamiz.
+async function handleUnsupportedMessage(
+  ctx: BotContext,
+  client: ClientData,
+  businessConnectionId?: string
+): Promise<void> {
+  if (client.unsupportedMessageNoted) return;
+  client.unsupportedMessageNoted = true;
+  clientsStore.save(client);
+  const reply = client.language !== "ru"
+    ? "Savolingiz bo'lsa, matn bilan yozing — yordam beraman."
+    : "Если есть вопрос, напишите текстом — я помогу.";
+  await sendMsg(ctx, client.chatId, reply, businessConnectionId);
+}
+
 // ─── Rasmlar ─────────────────────────────────────────────────────────────────
 
 async function handlePhotos(
@@ -670,6 +746,11 @@ async function handleText(
     clientsStore.save(client);
   }
 
+  if (intent === "refund_request" && !client.refundRequested) {
+    client.refundRequested = true;
+    clientsStore.save(client);
+  }
+
   if (intent === "greeting") {
     const greetBack = shouldGreetBack(client);
     if (greetBack) {
@@ -679,6 +760,7 @@ async function handleText(
         language: client.language,
         cameraModel: client.lastModelName ? modelsStore.getByName(client.lastModelName) : undefined,
         connectionMethod: client.connectionMethod,
+        refundRequested: client.refundRequested,
         firstName: client.firstName,
         shouldGreet: true,
         history: client.messageHistory || [],
@@ -719,7 +801,11 @@ async function handleText(
       client.awaitingConnectionConfirm = false;
       client.connectionConfirmed = true;
       clientsStore.save(client);
-      await sendReview(ctx, client, businessConnectionId);
+      // Norozi bo'lgan yoki pul qaytarishni so'ragan mijozdan sharh so'ralmaydi —
+      // xafa bo'lib salbiy sharh qoldirishi mumkin.
+      if (!client.refundRequested) {
+        await sendReview(ctx, client, businessConnectionId);
+      }
     }
     return;
   }
@@ -756,6 +842,7 @@ async function handleText(
     language: client.language,
     cameraModel,
     connectionMethod: client.connectionMethod,
+    refundRequested: client.refundRequested,
     firstName: client.firstName,
     shouldGreet: false,
     history: client.messageHistory || [],

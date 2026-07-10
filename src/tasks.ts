@@ -24,6 +24,7 @@ async function checkReviews(bot: Telegraf<BotContext>): Promise<void> {
   for (const client of clients) {
     if (client.reviewSent) continue;
     if (!client.lastModelName) continue;
+    if (client.refundRequested) continue;
 
     const lastSeen = new Date(client.lastSeen).getTime();
     if (now - lastSeen < REVIEW_DELAY_MS) continue;

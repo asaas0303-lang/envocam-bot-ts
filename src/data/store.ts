@@ -81,6 +81,8 @@ export interface ClientData {
   lastModelName?: string;
   connectionMethod?: "short" | "long";
   awaitingConnectionMethod?: boolean;
+  refundRequested?: boolean;
+  unsupportedMessageNoted?: boolean;
   lastInteractionDate?: string;
   region?: string;
   feedbackStage?: FeedbackStage;
