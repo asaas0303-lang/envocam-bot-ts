@@ -63,6 +63,24 @@ function getOrCreateClient(chatId: string, firstName?: string): ClientData {
   };
 }
 
+// ─── Mijoz bo'yicha navbat ────────────────────────────────────────────────────
+// handleText/handleFeedback bir mijoz uchun bir vaqtning o'zida faqat bittadan
+// ishlashi kerak (aks holda ikkita ketma-ket xabar bir xil client obyektini
+// parallel o'zgartirib, aralash tilda/ikki marta javob yuborilishiga olib
+// keladi). Boshqa mijozlarni BLOKLAMAYDI — har bir chatId o'z navbatiga ega.
+
+const chatQueues = new Map<string, Promise<void>>();
+
+function runSerialized(chatId: string, task: () => Promise<void>): void {
+  const prev = chatQueues.get(chatId) ?? Promise.resolve();
+  const run = prev.then(task).catch((err) => {
+    logger.error({ err, chatId }, "queued chat task failed");
+  }).finally(() => {
+    if (chatQueues.get(chatId) === run) chatQueues.delete(chatId);
+  });
+  chatQueues.set(chatId, run);
+}
+
 // ─── Xabarni qayta ishlash ────────────────────────────────────────────────────
 
 async function processIncomingMessage(
@@ -103,16 +121,23 @@ async function processIncomingMessage(
     // yozayapti" pauzasi, 15-70 soniyagacha). Telegraf keyingi yangilanishlarni
     // shu update to'liq tugagach so'raydi, shuning uchun bu ikkalasini
     // KUTMASDAN ishga tushiramiz — aks holda shu vaqt ichida yozgan boshqa
-    // mijozlarning xabarlari umuman olinmay qoladi.
+    // mijozlarning xabarlari umuman olinmay qoladi. runSerialized shu mijoz
+    // uchun xabarlar ketma-ket (parallel emas) ishlanishini kafolatlaydi.
     if (client.feedbackStage && client.feedbackStage !== "done") {
-      handleFeedback(ctx, client, text, businessConnectionId).catch((err) => {
-        logger.error({ err, chatId }, "handleFeedback failed");
-      });
+      runSerialized(chatId, () =>
+        handleFeedback(ctx, client, text, businessConnectionId).catch(async (err) => {
+          logger.error({ err, chatId }, "handleFeedback failed");
+          await sendFallbackError(ctx, client, businessConnectionId);
+        })
+      );
       return;
     }
-    handleText(ctx, client, text, businessConnectionId).catch((err) => {
-      logger.error({ err, chatId }, "handleText failed");
-    });
+    runSerialized(chatId, () =>
+      handleText(ctx, client, text, businessConnectionId).catch(async (err) => {
+        logger.error({ err, chatId }, "handleText failed");
+        await sendFallbackError(ctx, client, businessConnectionId);
+      })
+    );
     return;
   }
 }
@@ -242,6 +267,24 @@ async function sendMsg(
     } as any);
   } else {
     await ctx.telegram.sendMessage(chatId, text);
+  }
+}
+
+// handleText/handleFeedback xatoga uchraganda mijoz butunlay javobsiz
+// qolmasligi uchun — avval xatolik logger.error orqali yoziladi, lekin
+// mijozning o'ziga hech qanday xabar bormas edi, shuni tuzatadi.
+async function sendFallbackError(
+  ctx: BotContext,
+  client: ClientData,
+  businessConnectionId?: string
+): Promise<void> {
+  const msg = client.language !== "ru"
+    ? "Kechirasiz, xatolik yuz berdi. Birozdan so'ng qayta yozib ko'ring."
+    : "Извините, произошла ошибка. Попробуйте написать чуть позже.";
+  try {
+    await sendMsg(ctx, client.chatId, msg, businessConnectionId);
+  } catch {
+    // fallback ham yuborilmasa, qila oladigan narsa yo'q
   }
 }
 
