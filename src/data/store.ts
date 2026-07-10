@@ -58,7 +58,7 @@ export type FeedbackStage =
 
 export interface ClientData {
   chatId: string;
-  language: "uz" | "ru";
+  language: "uz" | "uz-cyrl" | "ru";
   firstName?: string;
   hasGreeted: boolean;
   askedForPhotoOnce: boolean;

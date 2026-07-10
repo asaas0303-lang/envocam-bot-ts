@@ -158,7 +158,7 @@ export async function extractTextFromImage(
 
 export interface AnswerOptions {
   question: string;
-  language: "uz" | "ru";
+  language: "uz" | "uz-cyrl" | "ru";
   cameraModel: CameraModel | undefined;
   firstName?: string;
   shouldGreet: boolean;       // bu xabarda salom berish kerakmi
@@ -197,7 +197,7 @@ export async function answerQuestion(opts: AnswerOptions): Promise<string> {
       knowledgeBase.push("=== Qo'shimcha izohlar ===\n" + imgCaptions.join("\n"));
   }
 
-  const isUz = language === "uz";
+  const isUz = language === "uz" || language === "uz-cyrl";
 
   // ─ Salomlashish ko'rsatmasi ─
   let greetingNote = "";
@@ -256,6 +256,10 @@ ${samples.length > 0
       ? "\n\n=== Примеры общения (придерживайся этого стиля) ===\n" + samples.join("\n\n---\n\n")
       : ""}`;
 
+  const finalSystemPrompt = language === "uz-cyrl"
+    ? systemPrompt + `\n\nMUHIM: Mijoz sizga kirill yozuvida yozmoqda. Javobingizni FAQAT kirill yozuvida yozing (lotin emas) — masalan "Assalomu alaykum" emas "Ассалому алайкум", "Rahmat" emas "Раҳмат" deb yozing.`
+    : systemPrompt;
+
   // ─ Tarix ─
   const historyMessages = history.slice(-16).map((m) => ({
     role: m.role as "user" | "assistant",
@@ -265,7 +269,7 @@ ${samples.length > 0
   const response = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 1024,
-    system: systemPrompt,
+    system: finalSystemPrompt,
     messages: [
       ...historyMessages,
       { role: "user", content: question },

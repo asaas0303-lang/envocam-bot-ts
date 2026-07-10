@@ -2,10 +2,18 @@ import type { Context } from "telegraf";
 import axios from "axios";
 import type { CameraModel } from "./data/store.js";
 
-export function detectLanguage(text: string): "uz" | "ru" {
-  if (/[\u049B\u0493\u04B3\u04AF]/i.test(text)) return "uz";
+// Faqat o'zbek kirillchasida uchraydigan harflar (rus alifbosida yo'q): Q, G', H, O' harflarining kirillchasi
+const UZ_CYRILLIC_CHARS = /[\u049A\u049B\u0492\u0493\u04B2\u04B3\u040E\u045E]/;
+// Kirillcha yozilgan bo'lsa ham, bu so'zlar odatda o'zbekcha (ruscha emas)
+const UZ_CYRILLIC_WORDS = /(\u0430\u0441\u0441\u0430\u043B\u043E\u043C\u0443|\u0430\u043B\u0435\u0439\u043A\u0443\u043C|\u0430\u043B\u0430\u0439\u043A\u0443\u043C|\u0440\u0430\u0445\u043C\u0430\u0442|\u0440\u0430\u04B3\u043C\u0430\u0442|\u044F\u0445\u0448\u0438\u043C\u0438\u0441\u0438\u0437|\u044F\u0445\u0448\u0438|\u0445\u0430\u0439\u0440|\u049B\u0430\u043D\u0434\u0430\u0439|\u043A\u0430\u043D\u0430\u043A\u0430|\u043D\u0438\u043C\u0430|\u049B\u0430\u0447\u043E\u043D|\u043A\u0430\u0447\u043E\u043D|\u043A\u0435\u0440\u0430\u043A|\u0431\u0443\u043B\u0430\u0434\u0438)/i;
+
+export function detectLanguage(text: string): "uz" | "uz-cyrl" | "ru" {
+  const cyrillicCount = (text.match(/[\u0400-\u04FF]/g) || []).length;
+  if (cyrillicCount > 0 && (UZ_CYRILLIC_CHARS.test(text) || UZ_CYRILLIC_WORDS.test(text))) {
+    return "uz-cyrl";
+  }
   if (/o['\u2018\u2019 ]/i.test(text)) return "uz";
-  if ((text.match(/[\u0430-\u044F]/g) || []).length > 3) return "ru";
+  if (cyrillicCount > 3) return "ru";
   return "uz";
 }
 

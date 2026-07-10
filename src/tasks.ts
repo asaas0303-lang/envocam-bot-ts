@@ -62,7 +62,7 @@ async function checkConnectionFollowups(bot: Telegraf<BotContext>): Promise<void
 
     try {
       const msg =
-        client.language === "uz"
+        client.language !== "ru"
           ? "Kamerani ulay oldingizmi? Qiyinchilik bo'lsa yozing."
           : "Удалось подключить камеру? Если есть трудности, напишите.";
       const opts = client.businessConnectionId
@@ -92,7 +92,7 @@ async function checkFeedbackCollection(bot: Telegraf<BotContext>): Promise<void>
     const videoSentAt = new Date(client.lastVideoSentAt).getTime();
     if (now - videoSentAt < FEEDBACK_DELAY_MS) continue;
 
-    const isUz = client.language === "uz";
+    const isUz = client.language !== "ru";
     const msg = isUz
       ? "Bir savol bersam maylimi? Qaysi viloyat yoki shahardan yozyapsiz?"
       : "Позвольте задать вопрос. Из какого вы города или региона?";

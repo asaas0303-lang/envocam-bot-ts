@@ -12,6 +12,7 @@ import {
 } from "../helpers.js";
 import { identifyModelFromImages, detectIntent, answerQuestion } from "../ai.js";
 import type { ClientFeedback } from "../data/store.js";
+import { logger } from "../lib/logger.js";
 
 const MAX_HISTORY = 20;
 const GREETING_PAUSE_HOURS = 8;
@@ -97,11 +98,21 @@ async function processIncomingMessage(
     return;
   }
   if (msg.text) {
+    const text = msg.text as string;
+    // handleText/handleFeedback ataylab kechikadi (AI javobi + "inson kabi
+    // yozayapti" pauzasi, 15-70 soniyagacha). Telegraf keyingi yangilanishlarni
+    // shu update to'liq tugagach so'raydi, shuning uchun bu ikkalasini
+    // KUTMASDAN ishga tushiramiz — aks holda shu vaqt ichida yozgan boshqa
+    // mijozlarning xabarlari umuman olinmay qoladi.
     if (client.feedbackStage && client.feedbackStage !== "done") {
-      await handleFeedback(ctx, client, msg.text as string, businessConnectionId);
+      handleFeedback(ctx, client, text, businessConnectionId).catch((err) => {
+        logger.error({ err, chatId }, "handleFeedback failed");
+      });
       return;
     }
-    await handleText(ctx, client, msg.text as string, businessConnectionId);
+    handleText(ctx, client, text, businessConnectionId).catch((err) => {
+      logger.error({ err, chatId }, "handleText failed");
+    });
     return;
   }
 }
@@ -279,7 +290,7 @@ async function handleFeedback(
   text: string,
   businessConnectionId?: string
 ): Promise<void> {
-  const isUz = client.language === "uz";
+  const isUz = client.language !== "ru";
   const chatId = client.chatId;
 
   if (!client.feedback) {
@@ -345,7 +356,7 @@ async function handleVoice(
   client.voiceSent = true;
   clientsStore.save(client);
   const reply =
-    client.language === "uz"
+    client.language !== "ru"
       ? "Kechirasiz, hozircha matn ko'rinishida yozsangiz tushunarli bo'ladi."
       : "Извините, пока лучше напишите текстом.";
   await sendMsg(ctx, client.chatId, reply, businessConnectionId);
@@ -363,7 +374,7 @@ async function handlePhotos(
   const models = modelsStore.getAll();
 
   if (models.length === 0) {
-    const msg = client.language === "uz"
+    const msg = client.language !== "ru"
       ? "Hozircha qo'llanmalar mavjud emas."
       : "Пока руководства недоступны.";
     await sendMsg(ctx, chatId, msg, businessConnectionId);
@@ -376,7 +387,7 @@ async function handlePhotos(
     if (dl) clientImages.push(dl);
   }
   if (clientImages.length === 0) {
-    const msg = client.language === "uz" ? "Rasmni o'qib bo'lmadi." : "Не удалось прочитать фото.";
+    const msg = client.language !== "ru" ? "Rasmni o'qib bo'lmadi." : "Не удалось прочитать фото.";
     await sendMsg(ctx, chatId, msg, businessConnectionId);
     return;
   }
@@ -397,7 +408,7 @@ async function handlePhotos(
     client.hasGreeted = true;
     client.lastInteractionDate = todayStr();
 
-    const isUz = client.language === "uz";
+    const isUz = client.language !== "ru";
 
     if (model && model.videoGuides.length > 0) {
       const firstCaption = model.videoGuides[0].caption ||
@@ -434,13 +445,13 @@ async function handlePhotos(
     if (!client.askedForPhotoOnce) {
       client.askedForPhotoOnce = true;
       clientsStore.save(client);
-      const msg = client.language === "uz"
+      const msg = client.language !== "ru"
         ? "Yorug' joyda, model yozuvi ko'rinadigan qilib qayta rasm yuboring."
         : "Пожалуйста, сделайте фото в светлом месте, чтобы была видна модель.";
       await sendMsg(ctx, chatId, msg, businessConnectionId);
     }
   } else {
-    const msg = client.language === "uz"
+    const msg = client.language !== "ru"
       ? "Bu kamera uchun qo'llanma tez orada tayyorlanadi, biroz sabr qiling."
       : "Руководство для этой камеры скоро будет готово, подождите немного.";
     await sendMsg(ctx, chatId, msg, businessConnectionId);
@@ -494,7 +505,7 @@ async function handleText(
   if (intent === "gratitude") {
     if (!client.gratitudeSent) {
       client.gratitudeSent = true;
-      const reply = client.language === "uz"
+      const reply = client.language !== "ru"
         ? "Arzimaydi. Savol bo'lsa yozing."
         : "Не за что. Если есть вопросы, пишите.";
       addToHistory(client, "user", text);
@@ -519,7 +530,7 @@ async function handleText(
   if (intent === "cannot_send_photo") {
     client.hasGreeted = true;
     client.lastInteractionDate = todayStr();
-    const reply = client.language === "uz"
+    const reply = client.language !== "ru"
       ? "Tushunarli, kamerangiz qaysi model ekanini so'z bilan yozing."
       : "Понятно, напишите текстом, какая у вас модель камеры.";
     addToHistory(client, "user", text);
@@ -560,7 +571,7 @@ async function handleText(
     client.askedForPhotoOnce = true;
     clientsStore.save(client);
     await sendMsg(ctx, chatId,
-      client.language === "uz"
+      client.language !== "ru"
         ? "Aniqroq yordam bera olishim uchun kamerangiz rasmini yuboring."
         : "Чтобы помочь точнее — пришлите фото вашей камеры.",
       businessConnectionId
