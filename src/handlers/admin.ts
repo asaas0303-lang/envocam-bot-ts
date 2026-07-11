@@ -1,10 +1,29 @@
 import { Telegraf, Markup } from "telegraf";
 import type { BotContext } from "../types.js";
-import { modelsStore, clientsStore, samplesStore, reportsStore, type CameraModel } from "../data/store.js";
+import {
+  modelsStore,
+  clientsStore,
+  samplesStore,
+  reportsStore,
+  issuesStore,
+  modelMentionsStore,
+  refundEventsStore,
+  activityStore,
+  type CameraModel,
+} from "../data/store.js";
 import { isAdmin, downloadFileAsBase64, sleep } from "../helpers.js";
 import { extractTextFromImage, analyzeInsights } from "../ai.js";
 import { sendReportNow } from "../tasks.js";
-import { formatRegionStats, formatGeneralStats } from "../stats.js";
+import {
+  formatRegionStats,
+  formatGeneralStats,
+  formatIssueRanking,
+  formatModelRanking,
+  formatPeakActivity,
+  formatReturningCustomerRate,
+  formatRefundStats,
+  formatNewVsReturningPerWeek,
+} from "../stats.js";
 
 type AdminState =
   | { step: "idle" }
@@ -169,6 +188,115 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     await ctx.reply(text, Markup.inlineKeyboard([
       [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
     ]));
+  });
+
+  // ── Muammolar reytingi (davr bo'yicha) ──
+  bot.action("admin_stats_issues", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await ctx.editMessageText("Qaysi davr uchun ko'rsatilsin?", Markup.inlineKeyboard([
+      [Markup.button.callback("Oxirgi 1 oy", "admin_stats_issues__30"),
+       Markup.button.callback("Oxirgi 3 oy", "admin_stats_issues__90")],
+      [Markup.button.callback("Oxirgi 6 oy", "admin_stats_issues__180"),
+       Markup.button.callback("Oxirgi 1 yil", "admin_stats_issues__365")],
+      [Markup.button.callback("Hammasi", "admin_stats_issues__all")],
+      [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+    ]));
+  });
+
+  bot.action(/^admin_stats_issues__(30|90|180|365|all)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const windowKey = ctx.match[1];
+    const { since, label } = resolveStatsWindow(windowKey);
+    const clients = clientsStore.getAll();
+    const totalConversations = clients.filter(
+      (c) => !since || new Date(c.lastSeen).getTime() >= since.getTime()
+    ).length;
+    const text = formatIssueRanking(issuesStore.getAll(), totalConversations, { since });
+    await sendChunkedReply(
+      ctx,
+      `Muammolar reytingi — ${label}:\n\n${text}`,
+      Markup.inlineKeyboard([[Markup.button.callback("⬅️ Davrlar", "admin_stats_issues")]])
+    );
+  });
+
+  // ── Model reytingi ──
+  bot.action("admin_stats_models", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatModelRanking(modelMentionsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+    ]));
+  });
+
+  // ── Faollik vaqtlari ──
+  bot.action("admin_stats_activity", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatPeakActivity(activityStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+    ]));
+  });
+
+  // ── Qaytgan mijozlar foizi ──
+  bot.action("admin_stats_returning", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatReturningCustomerRate(clientsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+    ]));
+  });
+
+  // ── Pul qaytarish statistikasi ──
+  bot.action("admin_stats_refunds", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatRefundStats(refundEventsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+    ]));
+  });
+
+  // ── Haftalik yangi/qaytgan mijozlar ──
+  bot.action("admin_stats_weekly", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatNewVsReturningPerWeek(clientsStore.getAll(), activityStore.getAll());
+    await sendChunkedReply(ctx, text, Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+    ]));
+  });
+
+  // ── Model bo'yicha muammolar ──
+  bot.action("admin_stats_model_issues", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const models = modelsStore.getAll();
+    if (models.length === 0) {
+      await ctx.editMessageText("Hozircha modellar yo'q.",
+        Markup.inlineKeyboard([[Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")]]));
+      return;
+    }
+    const buttons = models.map((m) => [Markup.button.callback(m.name, `admin_stats_model_issues__${m.name}`)]);
+    buttons.push([Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")]);
+    await ctx.editMessageText("Qaysi model uchun ko'rsatilsin?", Markup.inlineKeyboard(buttons));
+  });
+
+  bot.action(/^admin_stats_model_issues__(.+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const modelName = ctx.match[1];
+    const totalConversations = clientsStore.getAll().filter((c) => c.lastModelName === modelName).length;
+    const text = formatIssueRanking(issuesStore.getAll(), totalConversations, { modelName });
+    await sendChunkedReply(
+      ctx,
+      `${modelName} — muammolar reytingi:\n\n${text}`,
+      Markup.inlineKeyboard([[Markup.button.callback("⬅️ Modellarga qaytish", "admin_stats_model_issues")]])
+    );
   });
 
   // ── Bosh menyu ──
@@ -518,10 +646,31 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
 function buildStatsMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("Joylashuv (viloyatlar)", "admin_stats_region")],
+    [Markup.button.callback("Muammolar reytingi", "admin_stats_issues"),
+     Markup.button.callback("Model reytingi", "admin_stats_models")],
+    [Markup.button.callback("Faollik vaqtlari", "admin_stats_activity"),
+     Markup.button.callback("Qaytgan mijozlar", "admin_stats_returning")],
+    [Markup.button.callback("Pul qaytarish", "admin_stats_refunds"),
+     Markup.button.callback("Yangi/qaytgan (haftalik)", "admin_stats_weekly")],
+    [Markup.button.callback("Model bo'yicha muammolar", "admin_stats_model_issues")],
     [Markup.button.callback("Mijoz istaklari (AI tahlil)", "admin_stats_insights")],
     [Markup.button.callback("Umumiy statistika", "admin_stats_general")],
     [Markup.button.callback("⬅️ Asosiy menyu", "admin_back_main")],
   ]);
+}
+
+const STATS_WINDOWS: Record<string, { days: number | null; label: string }> = {
+  "30": { days: 30, label: "Oxirgi 1 oy" },
+  "90": { days: 90, label: "Oxirgi 3 oy" },
+  "180": { days: 180, label: "Oxirgi 6 oy" },
+  "365": { days: 365, label: "Oxirgi 1 yil" },
+  all: { days: null, label: "Hammasi" },
+};
+
+function resolveStatsWindow(key: string): { since: Date | undefined; label: string } {
+  const w = STATS_WINDOWS[key] ?? STATS_WINDOWS["all"]!;
+  const since = w.days ? new Date(Date.now() - w.days * 24 * 60 * 60 * 1000) : undefined;
+  return { since, label: w.label };
 }
 
 async function sendChunkedReply(

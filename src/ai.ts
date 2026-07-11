@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { CameraModel, ClientFeedback, MessageRecord } from "./data/store.js";
+import { REGIONS, type CameraModel, type ClientFeedback, type MessageRecord, type Region } from "./data/store.js";
 
 const anthropic = new Anthropic({
   apiKey: process.env["ANTHROPIC_API_KEY"],
@@ -90,16 +90,17 @@ Faqat JSON qaytar: {"status": "matched|unclear|no_match", "model": "nom yoki nul
 export interface IntentResult {
   intent: "greeting" | "gratitude" | "question" | "cannot_send_photo" | "connect_camera" | "refund_request";
   connectionMethod: "short" | "long" | null;
+  productFeedback: string | null;
 }
 
 export async function detectIntent(text: string): Promise<IntentResult> {
   const response = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 96,
+    max_tokens: 128,
     messages: [
       {
         role: "user",
-        content: `Faqat JSON qaytar: {"intent": "greeting|gratitude|question|cannot_send_photo|connect_camera|refund_request", "connectionMethod": "short|long|null"}
+        content: `Faqat JSON qaytar: {"intent": "greeting|gratitude|question|cannot_send_photo|connect_camera|refund_request", "connectionMethod": "short|long|null", "productFeedback": "qisqa tavsif yoki null"}
 
 INTENT (bittasini tanla):
 - greeting: salom, assalomu alaykum, hi, hello, privjet, zdravstvujte
@@ -113,18 +114,24 @@ CONNECTION METHOD — faqat xabarda ANIQ tilga olingan bo'lsa ko'rsat, aks holda
 - "short": qisqa masofa, kamera WiFi'siga to'g'ridan-to'g'ri ulanish, yaqin masofadan
 - "long": uzoq masofa, uy/router WiFi'si orqali, istalgan joydan (uzoqdan) ko'rish
 
+PRODUCT FEEDBACK — agar xabarda kamera haqida shikoyat, istak/xususiyat so'rovi yoki yoqtirish/yoqtirmaslik bo'lsa, buni 2-5 so'zda qisqa ifodada yoz (masalan: "video sifati past", "tungi ko'rish yo'q", "batareya tez tugaydi", "narxi qimmat"). Aks holda null.
+
 Xabar: "${text}"`,
       },
     ],
   });
 
-  const fallback: IntentResult = { intent: "question", connectionMethod: null };
+  const fallback: IntentResult = { intent: "question", connectionMethod: null, productFeedback: null };
   const block = response.content[0];
   if (block.type !== "text") return fallback;
   try {
     const jsonMatch = block.text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return fallback;
-    const parsed = JSON.parse(jsonMatch[0]) as { intent?: string; connectionMethod?: string | null };
+    const parsed = JSON.parse(jsonMatch[0]) as {
+      intent?: string;
+      connectionMethod?: string | null;
+      productFeedback?: string | null;
+    };
     const validIntents = ["greeting", "gratitude", "cannot_send_photo", "connect_camera", "refund_request", "question"];
     const intent = validIntents.includes(parsed.intent ?? "")
       ? (parsed.intent as IntentResult["intent"])
@@ -133,9 +140,85 @@ Xabar: "${text}"`,
       parsed.connectionMethod === "short" || parsed.connectionMethod === "long"
         ? parsed.connectionMethod
         : null;
-    return { intent, connectionMethod };
+    const productFeedback =
+      typeof parsed.productFeedback === "string" &&
+      parsed.productFeedback.trim() &&
+      parsed.productFeedback.trim().toLowerCase() !== "null"
+        ? parsed.productFeedback.trim()
+        : null;
+    return { intent, connectionMethod, productFeedback };
   } catch {
     return fallback;
+  }
+}
+
+// ─── Muammo/istak kategoriyasini aniqlash (mavjudga moslash yoki yangi ochish) ──
+
+export async function classifyProductFeedback(
+  feedbackText: string,
+  existingLabels: string[]
+): Promise<string | null> {
+  const response = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 64,
+    messages: [
+      {
+        role: "user",
+        content: `Mijoz kamera haqida shunday dedi: "${feedbackText}"
+
+Mavjud muammo/istak kategoriyalari:
+${existingLabels.length > 0 ? existingLabels.map((l) => `- ${l}`).join("\n") : "(hali kategoriya yo'q)"}
+
+Vazifa: agar bu fikr yuqoridagi kategoriyalardan biriga MA'NO jihatdan mos kelsa, o'sha kategoriya nomini AYNAN o'zidek qaytar (harfma-harf bir xil). Aks holda yangi qisqa kategoriya nomi taklif qil (2-4 so'z, masalan "Video sifati past").
+
+Faqat JSON qaytar: {"label": "kategoriya nomi"}`,
+      },
+    ],
+  });
+
+  const block = response.content[0];
+  if (block.type !== "text") return null;
+  try {
+    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]) as { label?: string };
+    const label = parsed.label?.trim();
+    return label ? label : null;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Viloyatni ro'yxatdagi nomga moslashtirish ──────────────────────────────
+
+export async function classifyRegion(text: string): Promise<Region | null> {
+  const response = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 64,
+    messages: [
+      {
+        role: "user",
+        content: `Mijoz javobi: "${text}"
+
+Quyidagi ro'yxatdan mijoz aytgan hududga ENG yaqin mos kelganini tanla:
+${REGIONS.join(", ")}
+
+Agar hech biriga ishonch bilan mos kelmasa, "null" qaytar.
+Faqat JSON qaytar: {"region": "ro'yxatdagi aynan nom yoki null"}`,
+      },
+    ],
+  });
+
+  const block = response.content[0];
+  if (block.type !== "text") return null;
+  try {
+    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]) as { region?: string | null };
+    const region = parsed.region;
+    return (REGIONS as readonly string[]).includes(region ?? "") ? (region as Region) : null;
+  } catch {
+    return null;
   }
 }
 

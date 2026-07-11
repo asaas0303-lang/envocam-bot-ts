@@ -1,6 +1,16 @@
 import { Telegraf } from "telegraf";
 import type { BotContext } from "../types.js";
-import { modelsStore, clientsStore, samplesStore, type ClientData, type MessageRecord } from "../data/store.js";
+import {
+  modelsStore,
+  clientsStore,
+  samplesStore,
+  issuesStore,
+  modelMentionsStore,
+  refundEventsStore,
+  activityStore,
+  type ClientData,
+  type MessageRecord,
+} from "../data/store.js";
 import {
   detectLanguage,
   isAdmin,
@@ -10,7 +20,7 @@ import {
   sendSplitMessages,
   sleep,
 } from "../helpers.js";
-import { identifyModelFromImages, detectIntent, answerQuestion } from "../ai.js";
+import { identifyModelFromImages, detectIntent, answerQuestion, classifyProductFeedback, classifyRegion } from "../ai.js";
 import type { ClientFeedback } from "../data/store.js";
 import { logger } from "../lib/logger.js";
 
@@ -104,6 +114,7 @@ async function processIncomingMessage(
   if (firstName && !client.firstName) client.firstName = firstName;
 
   clientsStore.save(client);
+  activityStore.record(chatId);
 
   // Tur bo'yicha yo'naltirish
   if (msg.voice) {
@@ -506,6 +517,21 @@ async function handleConnectionMethodAnswer(
   await deliverConnectionGuide(ctx, client, businessConnectionId);
 }
 
+// ─── Muammo/istak statistikasi ────────────────────────────────────────────────
+
+// Mavjud kategoriyalarga moslashtirib (yoki yangi ochib) mijoz fikrini qayd
+// etadi. Javobni kutmaymiz — mijozga yuboriladigan xabarni kechiktirmasin.
+function recordProductFeedback(feedbackText: string, client: ClientData): void {
+  const existingLabels = issuesStore.getAll().map((c) => c.label);
+  classifyProductFeedback(feedbackText, existingLabels)
+    .then((label) => {
+      if (label) issuesStore.recordMention(label, client.chatId, client.lastModelName);
+    })
+    .catch((err) => {
+      logger.error({ err, chatId: client.chatId }, "recordProductFeedback failed");
+    });
+}
+
 // ─── Feedback javoblari ───────────────────────────────────────────────────────
 
 async function handleFeedback(
@@ -522,7 +548,10 @@ async function handleFeedback(
   }
 
   if (client.feedbackStage === "ask_region") {
-    client.region = text.trim();
+    // Erkin matnni ro'yxatdagi viloyat nomiga moslashtiramiz —
+    // aks holda "Toshkent"/"toshkent shahri"/"TOSHKENT" alohida-alohida
+    // hisoblanib, statistikani buzardi.
+    client.region = (await classifyRegion(text)) ?? undefined;
     client.feedbackStage = "ask_satisfaction";
     const q = isUz
       ? "Rahmat. Kamerangizdan qoniqayapsizmi? Nima yoqmaydi yoki qiyin bo'ldi?"
@@ -530,6 +559,7 @@ async function handleFeedback(
     await sendMsg(ctx, chatId, q, businessConnectionId);
   } else if (client.feedbackStage === "ask_satisfaction") {
     client.feedback.satisfaction = text;
+    recordProductFeedback(text, client);
     client.feedbackStage = "ask_wishlist";
     const q = isUz
       ? "Tushundim. Qanday xususiyatlar bo'lsa kamerangiz yanada yaxshi bo'lardi?"
@@ -537,6 +567,7 @@ async function handleFeedback(
     await sendMsg(ctx, chatId, q, businessConnectionId);
   } else if (client.feedbackStage === "ask_wishlist") {
     client.feedback.wishlist = text;
+    recordProductFeedback(text, client);
     client.feedbackStage = "ask_location";
     const q = isUz
       ? "Kamera qayerga o'rnatilgan yoki o'rnatmoqchisiz?"
@@ -699,6 +730,7 @@ async function handlePhotos(
     client.hasGreeted = true;
     client.lastInteractionDate = todayStr();
     clientsStore.save(client);
+    modelMentionsStore.record(result.model, client.chatId);
 
     if (!client.connectionMethod) {
       client.awaitingConnectionMethod = true;
@@ -739,7 +771,7 @@ async function handleText(
     client.language = detectLanguage(text);
   }
 
-  const { intent, connectionMethod } = await detectIntent(text);
+  const { intent, connectionMethod, productFeedback } = await detectIntent(text);
 
   if (connectionMethod && !client.connectionMethod) {
     client.connectionMethod = connectionMethod;
@@ -749,6 +781,11 @@ async function handleText(
   if (intent === "refund_request" && !client.refundRequested) {
     client.refundRequested = true;
     clientsStore.save(client);
+    refundEventsStore.record(client.chatId, client.lastModelName);
+  }
+
+  if (productFeedback) {
+    recordProductFeedback(productFeedback, client);
   }
 
   if (intent === "greeting") {

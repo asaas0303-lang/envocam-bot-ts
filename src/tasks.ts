@@ -87,11 +87,15 @@ async function checkFeedbackCollection(bot: Telegraf<BotContext>): Promise<void>
   for (const client of clients) {
     // Allaqachon boshlangan yoki tugagan
     if (client.feedbackStage) continue;
-    // Video hali yuborilmagan
-    if (!client.lastVideoSentAt) continue;
+    // Mijoz bilan hali jiddiy muloqot bo'lmagan (masalan faqat bitta stiker yuborgan)
+    if (!client.hasGreeted) continue;
 
-    const videoSentAt = new Date(client.lastVideoSentAt).getTime();
-    if (now - videoSentAt < FEEDBACK_DELAY_MS) continue;
+    // Video yuborilgan bo'lsa o'shandan, aks holda (uzoq masofa mijozlari
+    // uchun ham) oxirgi ko'rinishdan FEEDBACK_DELAY_MS o'tgan bo'lishi kerak.
+    const baseTime = client.lastVideoSentAt
+      ? new Date(client.lastVideoSentAt).getTime()
+      : new Date(client.lastSeen).getTime();
+    if (now - baseTime < FEEDBACK_DELAY_MS) continue;
 
     const isUz = client.language !== "ru";
     const msg = isUz

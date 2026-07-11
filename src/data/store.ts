@@ -36,6 +36,55 @@ export interface CameraModel {
   reviewVideoFileId?: string;
 }
 
+// O'zbekistonning 14 hududi: 12 viloyat + Toshkent shahri (alohida) + Qoraqalpog'iston Respublikasi
+export const REGIONS = [
+  "Andijon",
+  "Buxoro",
+  "Farg'ona",
+  "Jizzax",
+  "Namangan",
+  "Navoiy",
+  "Qashqadaryo",
+  "Qoraqalpog'iston Respublikasi",
+  "Samarqand",
+  "Sirdaryo",
+  "Surxondaryo",
+  "Xorazm",
+  "Toshkent shahri",
+  "Toshkent viloyati",
+] as const;
+export type Region = (typeof REGIONS)[number];
+
+export interface IssueMention {
+  chatId: string;
+  modelName?: string;
+  timestamp: string;
+}
+
+export interface IssueCategory {
+  id: string;
+  label: string;
+  createdAt: string;
+  mentions: IssueMention[];
+}
+
+export interface ModelMention {
+  modelName: string;
+  chatId: string;
+  timestamp: string;
+}
+
+export interface RefundEvent {
+  chatId: string;
+  modelName?: string;
+  timestamp: string;
+}
+
+export interface ActivityEvent {
+  chatId: string;
+  timestamp: string;
+}
+
 export interface MessageRecord {
   role: "user" | "assistant";
   content: string;
@@ -111,6 +160,14 @@ interface DbShape {
   clients: ClientData[];
   samples: Sample[];
   reports: ReportsMeta;
+  issues: IssueCategory[];
+  modelMentions: ModelMention[];
+  refundEvents: RefundEvent[];
+  activityLog: ActivityEvent[];
+}
+
+function emptyDb(): DbShape {
+  return { models: [], clients: [], samples: [], reports: {}, issues: [], modelMentions: [], refundEvents: [], activityLog: [] };
 }
 
 function loadDb(): DbShape {
@@ -125,12 +182,16 @@ function loadDb(): DbShape {
         clients: parsed.clients ?? [],
         samples: parsed.samples ?? [],
         reports: parsed.reports ?? {},
+        issues: parsed.issues ?? [],
+        modelMentions: parsed.modelMentions ?? [],
+        refundEvents: parsed.refundEvents ?? [],
+        activityLog: parsed.activityLog ?? [],
       };
     } catch {
-      return { models: [], clients: [], samples: [], reports: {} };
+      return emptyDb();
     }
   }
-  return { models: [], clients: [], samples: [], reports: {} };
+  return emptyDb();
 }
 
 const db: DbShape = loadDb();
@@ -206,6 +267,53 @@ export const reportsStore = {
   },
   setLastReportDate(date: string): void {
     db.reports.lastReportDate = date;
+    persist();
+  },
+};
+
+export const issuesStore = {
+  getAll(): IssueCategory[] {
+    return db.issues;
+  },
+  // Mavjud kategoriyaga mos kelsa o'shanga, aks holda yangi kategoriya
+  // ochib, shu mijoz uchun bitta eslatma (mention) qo'shadi.
+  recordMention(label: string, chatId: string, modelName?: string): void {
+    let cat = db.issues.find((c) => c.label === label);
+    if (!cat) {
+      cat = { id: randomUUID(), label, createdAt: new Date().toISOString(), mentions: [] };
+      db.issues.push(cat);
+    }
+    cat.mentions.push({ chatId, modelName, timestamp: new Date().toISOString() });
+    persist();
+  },
+};
+
+export const modelMentionsStore = {
+  getAll(): ModelMention[] {
+    return db.modelMentions;
+  },
+  record(modelName: string, chatId: string): void {
+    db.modelMentions.push({ modelName, chatId, timestamp: new Date().toISOString() });
+    persist();
+  },
+};
+
+export const refundEventsStore = {
+  getAll(): RefundEvent[] {
+    return db.refundEvents;
+  },
+  record(chatId: string, modelName: string | undefined): void {
+    db.refundEvents.push({ chatId, modelName, timestamp: new Date().toISOString() });
+    persist();
+  },
+};
+
+export const activityStore = {
+  getAll(): ActivityEvent[] {
+    return db.activityLog;
+  },
+  record(chatId: string): void {
+    db.activityLog.push({ chatId, timestamp: new Date().toISOString() });
     persist();
   },
 };
