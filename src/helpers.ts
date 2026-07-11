@@ -1,6 +1,5 @@
 import type { Context } from "telegraf";
 import axios from "axios";
-import type { CameraModel } from "./data/store.js";
 
 // Faqat o'zbek kirillchasida uchraydigan harflar (rus alifbosida yo'q): Q, G', H, O' harflarining kirillchasi
 const UZ_CYRILLIC_CHARS = /[\u049A\u049B\u0492\u0493\u04B2\u04B3\u040E\u045E]/;
@@ -63,21 +62,6 @@ export async function downloadFileCached(
   const dl = await downloadFileAsBase64(ctx, fileId);
   if (dl) fileCache.set(fileId, dl);
   return dl;
-}
-
-// Model uchun namuna rasmlarni (birinchi `cap` ta) yuklab beradi
-export async function getModelRefImages(
-  ctx: Context,
-  model: CameraModel,
-  cap = 3
-): Promise<{ base64: string; mimeType: string }[]> {
-  const refs = (model.images || []).slice(0, cap);
-  const out: { base64: string; mimeType: string }[] = [];
-  for (const img of refs) {
-    const dl = await downloadFileCached(ctx, img.file_id);
-    if (dl) out.push(dl);
-  }
-  return out;
 }
 
 export function sleep(ms: number): Promise<void> {

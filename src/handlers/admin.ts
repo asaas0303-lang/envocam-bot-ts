@@ -13,6 +13,7 @@ import {
 } from "../data/store.js";
 import { isAdmin, downloadFileAsBase64, sleep } from "../helpers.js";
 import { extractTextFromImage, analyzeInsights } from "../ai.js";
+import { COLLAGE_MAX_IMAGES } from "../collage.js";
 import { sendReportNow } from "../tasks.js";
 import {
   formatRegionStats,
@@ -112,7 +113,11 @@ function categoryMenuText(modelName: string, category: string): string {
   const model = modelsStore.getByName(modelName);
   const count = getCategoryCount(model, category);
   const label = CAT_LABELS[category] ?? category;
-  return `${modelName} — ${label}\nJami: ${count} ta material`;
+  let text = `${modelName} — ${label}\nJami: ${count} ta material`;
+  if (category === "images" && count > COLLAGE_MAX_IMAGES) {
+    text += `\n\n⚠️ ${COLLAGE_MAX_IMAGES} tadan ortiq rasm bor — model aniqlashda faqat birinchi ${COLLAGE_MAX_IMAGES} tasi ishlatiladi. Eng farqli burchaklarni qoldirib, ortiqchalarini o'chirishni tavsiya qilamiz.`;
+  }
+  return text;
 }
 
 // ─── Asosiy handler ro'yxati ──────────────────────────────────────────────────

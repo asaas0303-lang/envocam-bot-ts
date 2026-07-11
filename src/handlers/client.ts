@@ -15,12 +15,12 @@ import {
   detectLanguage,
   isAdmin,
   downloadFileAsBase64,
-  getModelRefImages,
   randomDelay,
   sendSplitMessages,
   sleep,
 } from "../helpers.js";
 import { identifyModelFromImages, detectIntent, answerQuestion, classifyProductFeedback, classifyRegion } from "../ai.js";
+import { getModelCollage } from "../collage.js";
 import type { ClientFeedback } from "../data/store.js";
 import { logger } from "../lib/logger.js";
 
@@ -717,7 +717,7 @@ async function handlePhotos(
 
   const modelRefs = [];
   for (const m of models) {
-    modelRefs.push({ name: m.name, refImages: await getModelRefImages(ctx, m) });
+    modelRefs.push({ name: m.name, refCollage: await getModelCollage(ctx, m) });
   }
 
   await randomDelay(25000, 70000);

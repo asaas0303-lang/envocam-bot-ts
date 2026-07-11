@@ -6,7 +6,9 @@ import { randomUUID } from "crypto";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Railway'da volume ulanganda bu papka doimiy diskka ishora qiladi;
 // bo'lmasa (masalan lokal ishga tushirishda) loyiha papkasiga yoziladi.
-const DATA_DIR = process.env["RAILWAY_VOLUME_MOUNT_PATH"] || path.join(__dirname, "..", "..");
+// Boshqa modullar ham (masalan collage.ts) shu doimiy papkadan foydalanishi
+// uchun eksport qilingan.
+export const DATA_DIR = process.env["RAILWAY_VOLUME_MOUNT_PATH"] || path.join(__dirname, "..", "..");
 const DATA_FILE = path.join(DATA_DIR, "data.json");
 
 if (!existsSync(DATA_DIR)) {
@@ -26,6 +28,12 @@ export interface TextGuideItem {
   text: string;
 }
 
+export interface RefCollageMeta {
+  path: string;        // DATA_DIR ga nisbatan fayl yo'li
+  sourceHash: string;  // qaysi rasmlardan yasalganini aniqlaydi (kesh bekor qilish uchun)
+  generatedAt: string;
+}
+
 export interface CameraModel {
   name: string;
   images: ImageItem[];
@@ -34,6 +42,7 @@ export interface CameraModel {
   longRangeGuides: TextGuideItem[]; // Uzoq masofa — uy routeri orqali ulanish, matnli yo'riqnoma
   reviewVoiceFileId?: string;
   reviewVideoFileId?: string;
+  refCollage?: RefCollageMeta;      // "Rasmlar" kategoriyasidan yasalgan taqqoslash kollaji (keshlangan)
 }
 
 // O'zbekistonning 14 hududi: 12 viloyat + Toshkent shahri (alohida) + Qoraqalpog'iston Respublikasi

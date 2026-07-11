@@ -28,25 +28,23 @@ function toImageBlock(img: ImageInput): Anthropic.ImageBlockParam {
 // Mijoz rasm(lar)ini namuna rasmlar bilan solishtirib model aniqlaydi
 export async function identifyModelFromImages(
   clientImages: ImageInput[],
-  models: { name: string; refImages: ImageInput[] }[]
+  models: { name: string; refCollage: ImageInput | null }[]
 ): Promise<{ status: "matched" | "unclear" | "no_match"; model: string | null }> {
   if (clientImages.length === 0) return { status: "unclear", model: null };
 
   const content: Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> = [];
   const modelNames = models.map((m) => m.name);
-  const withRefs = models.filter((m) => m.refImages.length > 0);
+  const withRefs = models.filter((m) => m.refCollage !== null);
 
   if (withRefs.length > 0) {
     content.push({
       type: "text",
-      text: "Quyida do'kondagi kameralarning NAMUNA rasmlari, har biri model nomi bilan belgilangan:",
+      text: "Quyida do'kondagi kameralarning namuna rasmlari — har bir model uchun bitta rasm, unda o'sha modelning bir nechta burchakdan olingan suratlari grid (jadval) shaklida birlashtirilgan. Har bir rasm model nomi bilan belgilangan:",
     });
     const sorted = [...withRefs].sort((a, b) => a.name.localeCompare(b.name));
     for (const m of sorted) {
-      for (let i = 0; i < m.refImages.length; i++) {
-        content.push({ type: "text", text: `Model: ${m.name} — namuna ${i + 1}` });
-        content.push(toImageBlock(m.refImages[i]!));
-      }
+      content.push({ type: "text", text: `Model: ${m.name}` });
+      content.push(toImageBlock(m.refCollage!));
     }
   }
 
