@@ -125,6 +125,16 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     await showMainMenu(ctx);
   });
 
+  // Diagnostika: jonli botda aynan qaysi commit ishlab turganini tekshirish uchun.
+  bot.command("version", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    const sha = process.env["RAILWAY_GIT_COMMIT_SHA"];
+    const msg = sha
+      ? `Joriy commit: ${sha.slice(0, 7)}\nTo'liq: ${sha}`
+      : "RAILWAY_GIT_COMMIT_SHA topilmadi (lokal muhitda ishlayapsizmi?).";
+    await ctx.reply(msg);
+  });
+
   bot.command("hisobot", async (ctx) => {
     if (!ctx.from || !isAdmin(ctx.from.id)) return;
     await sendReportNow(bot, String(ctx.from.id));
