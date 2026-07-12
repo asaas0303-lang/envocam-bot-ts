@@ -25,6 +25,37 @@ function toImageBlock(img: ImageInput): Anthropic.ImageBlockParam {
   };
 }
 
+// ─── Barcode raqamini o'qish (QR dekod ishlamasa, OCR fallback) ───────────────
+
+// "full" — stikerdagi to'liq uzun raqamni o'qishga harakat qiladi.
+// "last4" — faqat oxirgi (odatda kattaroq/qalinroq shriftdagi) 4 raqamni
+// o'qishga harakat qiladi, to'liq raqam o'qib bo'lmaganda ishlatiladi.
+export async function readBarcodeDigits(
+  image: ImageInput,
+  mode: "full" | "last4"
+): Promise<string | null> {
+  const instruction = mode === "full"
+    ? `Bu rasmda kamera qutisidagi oq stikerda vertikal yoki gorizontal yozilgan uzun barcode raqami bor (masalan 1000077693951, odatda 10 tadan ortiq xonali). Faqat shu raqamni yoz, boshqa hech narsa yozma — izoh, tushuntirish kerak emas. Aniq o'qiy olmasang yoki bunday raqam umuman ko'rinmasa, faqat "null" deb yoz.`
+    : `Bu rasmda kamera qutisidagi barcode raqamining OXIRGI 4 ta raqami bo'lishi mumkin — ular odatda qolgan raqamlarga qaraganda KATTAROQ va QALINROQ shriftda, alohida ajratib yozilgan bo'ladi. Faqat shu 4 ta raqamni yoz, boshqa hech narsa yozma. Aniq topolmasang faqat "null" deb yoz.`;
+
+  const response = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 32,
+    messages: [
+      {
+        role: "user",
+        content: [toImageBlock(image), { type: "text", text: instruction }],
+      },
+    ],
+  });
+
+  const block = response.content[0];
+  if (block.type !== "text") return null;
+  const digits = block.text.replace(/\D/g, "");
+  if (mode === "full") return digits.length >= 8 ? digits : null;
+  return digits.length === 4 ? digits : null;
+}
+
 // Mijoz rasm(lar)idan kamera modelini aniqlaydi. ENG ISHONCHLI belgi —
 // quti stikeridagi BARCODE raqami (model nomi qutida hech qachon
 // yozilmaydi). Barcode topilmasa/mos kelmasa, namuna rasmlar bilan vizual

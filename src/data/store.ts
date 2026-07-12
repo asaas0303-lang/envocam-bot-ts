@@ -140,7 +140,8 @@ export interface ClientData {
   lastModelName?: string;
   connectionMethod?: "short" | "long";
   awaitingConnectionMethod?: boolean;
-  awaitingBarcode?: boolean;
+  barcodeAttempts?: number;      // nechta marta "yaqinroq rasm" so'ralgan
+  awaitingModelName?: boolean;   // barcode aniqlanmagach, oxirgi chora — model nomini matn bilan so'rash
   refundRequested?: boolean;
   unsupportedMessageNoted?: boolean;
   lastInteractionDate?: string;
@@ -166,6 +167,14 @@ interface ReportsMeta {
   cachedInsights?: CachedInsights;
 }
 
+export interface StickerSample {
+  file_id: string;
+}
+
+interface AppSettings {
+  stickerSample?: StickerSample; // barcha modellar uchun umumiy — quti stikeri joyini ko'rsatuvchi namuna rasm
+}
+
 interface DbShape {
   models: CameraModel[];
   clients: ClientData[];
@@ -175,10 +184,14 @@ interface DbShape {
   modelMentions: ModelMention[];
   refundEvents: RefundEvent[];
   activityLog: ActivityEvent[];
+  settings: AppSettings;
 }
 
 function emptyDb(): DbShape {
-  return { models: [], clients: [], samples: [], reports: {}, issues: [], modelMentions: [], refundEvents: [], activityLog: [] };
+  return {
+    models: [], clients: [], samples: [], reports: {}, issues: [], modelMentions: [],
+    refundEvents: [], activityLog: [], settings: {},
+  };
 }
 
 function loadDb(): DbShape {
@@ -201,6 +214,7 @@ function loadDb(): DbShape {
         modelMentions: parsed.modelMentions ?? [],
         refundEvents: parsed.refundEvents ?? [],
         activityLog: parsed.activityLog ?? [],
+        settings: parsed.settings ?? {},
       };
     } catch {
       return emptyDb();
@@ -329,6 +343,20 @@ export const activityStore = {
   },
   record(chatId: string): void {
     db.activityLog.push({ chatId, timestamp: new Date().toISOString() });
+    persist();
+  },
+};
+
+export const settingsStore = {
+  getStickerSample(): StickerSample | undefined {
+    return db.settings.stickerSample;
+  },
+  setStickerSample(file_id: string): void {
+    db.settings.stickerSample = { file_id };
+    persist();
+  },
+  clearStickerSample(): void {
+    db.settings.stickerSample = undefined;
     persist();
   },
 };

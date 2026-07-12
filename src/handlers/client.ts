@@ -8,7 +8,9 @@ import {
   modelMentionsStore,
   refundEventsStore,
   activityStore,
+  settingsStore,
   type ClientData,
+  type CameraModel,
   type MessageRecord,
 } from "../data/store.js";
 import {
@@ -21,7 +23,6 @@ import {
   sleep,
 } from "../helpers.js";
 import {
-  identifyModelFromImages,
   detectIntent,
   answerQuestion,
   classifyProductFeedback,
@@ -29,7 +30,7 @@ import {
   classifyImage,
   type ImageClassification,
 } from "../ai.js";
-import { getModelCollage } from "../collage.js";
+import { readBarcodeFromImage, type BarcodeMethod } from "../barcode.js";
 import type { ClientFeedback } from "../data/store.js";
 import { logger } from "../lib/logger.js";
 
@@ -163,10 +164,10 @@ async function processIncomingMessage(
       );
       return;
     }
-    if (client.awaitingBarcode) {
+    if (client.awaitingModelName) {
       runSerialized(chatId, () =>
-        handleBarcodeAnswer(ctx, client, text, businessConnectionId).catch(async (err) => {
-          logger.error({ err, chatId }, "handleBarcodeAnswer failed");
+        handleModelNameAnswer(ctx, client, text, businessConnectionId).catch(async (err) => {
+          logger.error({ err, chatId }, "handleModelNameAnswer failed");
           await sendFallbackError(ctx, client, businessConnectionId);
         })
       );
@@ -393,6 +394,26 @@ async function sendVoiceMsg(
   }
 }
 
+async function sendPhotoMsg(
+  ctx: BotContext,
+  chatId: string,
+  fileId: string,
+  caption: string | undefined,
+  businessConnectionId?: string
+): Promise<void> {
+  if (businessConnectionId) {
+    const payload: Record<string, unknown> = {
+      chat_id: chatId,
+      photo: fileId,
+      business_connection_id: businessConnectionId,
+    };
+    if (caption) payload.caption = caption;
+    await ctx.telegram.callApi("sendPhoto", payload as any);
+  } else {
+    await ctx.telegram.sendPhoto(chatId, fileId, caption ? { caption } : {});
+  }
+}
+
 // ─── Ulash usuli (qisqa/uzoq masofa) ──────────────────────────────────────────
 
 function connectionMethodQuestion(language: ClientData["language"]): string {
@@ -407,10 +428,19 @@ function askForCameraPhotoText(language: ClientData["language"]): string {
     : "Чтобы помочь точнее — пришлите фото вашей камеры.";
 }
 
-function askForBarcodeText(language: ClientData["language"]): string {
+// Barcode avtomatik o'qilmagach, yaqinroq rasm so'raladi (QADAM 4).
+function askForCloserPhotoText(language: ClientData["language"]): string {
   return language !== "ru"
-    ? "Kamerangizni aniqlash uchun qutidagi oq stikerda yozilgan raqamni (masalan 1000077693951) yuboring. Yoki qutini stiker aniq ko'rinadigan qilib qayta suratga oling."
-    : "Чтобы определить камеру, отправьте номер с белого стикера на коробке (например 1000077693951). Или сфотографируйте коробку так, чтобы стикер было хорошо видно.";
+    ? "Kamerangizni aniqlash uchun qutidagi oq stikerni YAQINDAN suratga oling — telefonni stikerga yaqinlashtirib, QR kod va raqam aniq ko'rinadigan qilib."
+    : "Чтобы определить камеру, сфотографируйте белый стикер на коробке КРУПНЫМ ПЛАНОМ — поднесите телефон ближе, чтобы QR-код и номер были чётко видны.";
+}
+
+// Bir necha marta rasm ham yordam bermagach, oxirgi chora — model nomini
+// matn bilan so'raymiz (QADAM 5).
+function askForModelNameText(language: ClientData["language"]): string {
+  return language !== "ru"
+    ? "Qutida stiker yo'qmi yoki hali ham o'qib bo'lmayapti? Unda ayting — qaysi modelni oldingiz? (masalan A9, X5, X6)"
+    : "На коробке нет стикера, или его всё ещё не удаётся прочитать? Тогда подскажите, какую модель вы приобрели? (например A9, X5, X6)";
 }
 
 // Qisqa masofa — mavjud video yo'riqnomalarni ketma-ket yuboradi (avvalgi xatti-harakat o'zgarmagan)
@@ -587,48 +617,20 @@ async function notifyAdminsUnknownBarcode(
   }
 }
 
-// "awaitingBarcode" holatida kelgan javobni tekshiradi — mijoz quti
-// stikeridagi barcode raqamini yozgan bo'lishi kerak (kamida 8 xonali).
-async function handleBarcodeAnswer(
+// Barcode topilgan-u lekin ro'yxatda yo'q bo'lganda ishlatiladi: adminni
+// xabardor qilib, mijozga jim qolmasdan umumiy yordam beradi.
+async function handleUnknownBarcode(
   ctx: BotContext,
   client: ClientData,
-  text: string,
+  barcode: string,
   businessConnectionId?: string
 ): Promise<void> {
   const chatId = client.chatId;
-  const digits = text.replace(/\D/g, "");
-
-  if (digits.length < 8) {
-    // Raqam emas yoki juda qisqa — barcode javobi sifatida qabul qilmaymiz,
-    // oddiy savol sifatida ishlov beramiz.
-    client.awaitingBarcode = false;
-    clientsStore.save(client);
-    await handleText(ctx, client, text, businessConnectionId);
-    return;
-  }
-
-  client.awaitingBarcode = false;
-
-  const matchedModel = modelsStore.getAll().find((m) => m.barcodes.includes(digits));
-
-  if (matchedModel) {
-    client.lastModelName = matchedModel.name;
-    client.hasGreeted = true;
-    client.lastInteractionDate = todayStr();
-    clientsStore.save(client);
-    modelMentionsStore.record(matchedModel.name, client.chatId);
-    await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
-    return;
-  }
-
-  // Barcode ro'yxatda topilmadi — adminni xabardor qilamiz va mijozga
-  // jim qolmasdan umumiy yordam beramiz.
-  clientsStore.save(client);
-  await notifyAdminsUnknownBarcode(ctx, digits, client);
+  await notifyAdminsUnknownBarcode(ctx, barcode, client);
 
   const samples = samplesStore.getAll().map((s) => s.text);
   await randomDelay(15000, 50000);
-  const question = `Mijoz kamera qutisidagi barcode raqamini yubordi: ${digits}. Bu raqam hozircha bizning ro'yxatda yo'q.`;
+  const question = `Mijoz kamera qutisidagi barcode raqamini yubordi (rasmdan avtomatik o'qildi): ${barcode}. Bu raqam hozircha bizning ro'yxatda yo'q.`;
   const reply = await answerQuestion({
     question,
     language: client.language,
@@ -641,8 +643,107 @@ async function handleBarcodeAnswer(
     samples,
   });
 
+  addToHistory(client, "assistant", reply);
+  client.hasGreeted = true;
+  client.lastInteractionDate = todayStr();
+  clientsStore.save(client);
+
+  const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
+  for (const part of parts) {
+    await sendMsg(ctx, chatId, part, businessConnectionId);
+    if (parts.length > 1) await sleep(800);
+  }
+}
+
+function findModelByBarcode(
+  models: CameraModel[],
+  barcode: string,
+  method: BarcodeMethod
+): CameraModel | undefined {
+  if (method === "ocr_last4") {
+    return models.find((m) => m.barcodes.some((b) => b.slice(-4) === barcode));
+  }
+  return models.find((m) => m.barcodes.includes(barcode));
+}
+
+// QADAM 4 — barcode avtomatik o'qilmasa, admin yuklagan namuna rasm (stiker
+// joyi belgilangan) bilan birga "yaqinroq suratga oling" so'rovi yuboriladi.
+async function sendCloserPhotoRequest(
+  ctx: BotContext,
+  client: ClientData,
+  businessConnectionId?: string
+): Promise<void> {
+  const text = askForCloserPhotoText(client.language);
+  const sample = settingsStore.getStickerSample();
+  if (sample) {
+    await sendPhotoMsg(ctx, client.chatId, sample.file_id, text, businessConnectionId);
+  } else {
+    await sendMsg(ctx, client.chatId, text, businessConnectionId);
+  }
+}
+
+// "A9" / "а9" (kirillcha lotinga o'xshash harflar bilan) kabi yozuvlarni bir
+// xil deb solishtira olish uchun — lotinga o'xshash kirillcha harflarni
+// lotin harfiga almashtiramiz.
+const CYRILLIC_LOOKALIKES: Record<string, string> = {
+  "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T", "Х": "X",
+  "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x",
+};
+
+function normalizeModelNameInput(text: string): string {
+  let result = "";
+  for (const ch of text.trim()) {
+    result += CYRILLIC_LOOKALIKES[ch] ?? ch;
+  }
+  return result.toLowerCase().replace(/\s+/g, "");
+}
+
+// QADAM 5 — "awaitingModelName" holatida kelgan javobni tekshiradi (barcode
+// hech qanday usul bilan aniqlanmagach so'raladigan OXIRGI chora).
+async function handleModelNameAnswer(
+  ctx: BotContext,
+  client: ClientData,
+  text: string,
+  businessConnectionId?: string
+): Promise<void> {
+  const chatId = client.chatId;
+  client.awaitingModelName = false;
+  client.barcodeAttempts = 0;
+
+  const normalized = normalizeModelNameInput(text);
+  const matchedModel = modelsStore.getAll().find((m) => normalizeModelNameInput(m.name) === normalized);
+
+  if (matchedModel) {
+    client.lastModelName = matchedModel.name;
+    client.hasGreeted = true;
+    client.lastInteractionDate = todayStr();
+    clientsStore.save(client);
+    modelMentionsStore.record(matchedModel.name, client.chatId);
+    await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
+    return;
+  }
+
+  // QADAM 6 — baribir aniqlanmadi. Model aniqlashni to'xtatib, umumiy
+  // yordamga o'tamiz — mijoz HECH QACHON javobsiz qolmasligi kerak.
+  clientsStore.save(client);
+
+  const samples = samplesStore.getAll().map((s) => s.text);
+  await randomDelay(15000, 50000);
+  const reply = await answerQuestion({
+    question: text,
+    language: client.language,
+    cameraModel: undefined,
+    connectionMethod: client.connectionMethod,
+    refundRequested: client.refundRequested,
+    firstName: client.firstName,
+    shouldGreet: false,
+    history: client.messageHistory || [],
+    samples,
+  });
+
   addToHistory(client, "user", text);
   addToHistory(client, "assistant", reply);
+  client.hasGreeted = true;
   client.lastInteractionDate = todayStr();
   clientsStore.save(client);
 
@@ -909,32 +1010,48 @@ async function handlePhotos(
     return;
   }
 
-  const modelRefs = [];
-  for (const m of models) {
-    modelRefs.push({ name: m.name, barcodes: m.barcodes, refCollage: await getModelCollage(ctx, m) });
-  }
+  // Barcode raqamini AVTOMATIK o'qishga harakat qilamiz — avval QR kod
+  // (eng ishonchli, AI chaqirmaydi), keyin AI-OCR fallback. Mijozdan hech
+  // qachon raqamni qo'lda yozib yuborish so'ralmaydi.
+  await randomDelay(15000, 40000);
 
-  await randomDelay(25000, 70000);
-
-  const result = await identifyModelFromImages(clientImages, modelRefs);
+  const barcodeResult = await readBarcodeFromImage(clientImages[0]!, chatId);
   client = clientsStore.getById(client.chatId) ?? client;
 
-  if (result.status === "matched" && result.model) {
-    client.lastModelName = result.model;
-    client.hasGreeted = true;
-    client.lastInteractionDate = todayStr();
-    clientsStore.save(client);
-    modelMentionsStore.record(result.model, client.chatId);
-    await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
+  if (barcodeResult.barcode && barcodeResult.method) {
+    const matchedModel = findModelByBarcode(models, barcodeResult.barcode, barcodeResult.method);
+
+    if (matchedModel) {
+      client.lastModelName = matchedModel.name;
+      client.hasGreeted = true;
+      client.lastInteractionDate = todayStr();
+      client.barcodeAttempts = 0;
+      clientsStore.save(client);
+      modelMentionsStore.record(matchedModel.name, client.chatId);
+      await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
+      return;
+    }
+
+    // Barcode aniq o'qildi, lekin hech qanday modelga bog'lanmagan —
+    // adminni xabardor qilamiz, mijozni jim qoldirmaymiz.
+    await handleUnknownBarcode(ctx, client, barcodeResult.barcode, businessConnectionId);
     return;
   }
 
-  // unclear yoki no_match — ikkalasida ham quti stikeridagi barcode
-  // raqamini so'raymiz, chunki qutida model nomi umuman yozilmagan va
-  // vizual solishtirish yetarli emas.
-  client.awaitingBarcode = true;
+  // Barcode hech qanday usul (QR, to'liq OCR, oxirgi-4 OCR) bilan o'qilmadi.
+  client.barcodeAttempts = (client.barcodeAttempts ?? 0) + 1;
   clientsStore.save(client);
-  await sendMsg(ctx, chatId, askForBarcodeText(client.language), businessConnectionId);
+
+  if (client.barcodeAttempts <= 2) {
+    // QADAM 4 — yaqinroq rasm so'raymiz (namuna rasm bilan birga, mavjud bo'lsa).
+    await sendCloserPhotoRequest(ctx, client, businessConnectionId);
+  } else {
+    // QADAM 5 — ikki marta rasm ham yordam bermadi, oxirgi chora sifatida
+    // model nomini matn bilan so'raymiz.
+    client.awaitingModelName = true;
+    clientsStore.save(client);
+    await sendMsg(ctx, chatId, askForModelNameText(client.language), businessConnectionId);
+  }
 }
 
 // ─── Matn ─────────────────────────────────────────────────────────────────────

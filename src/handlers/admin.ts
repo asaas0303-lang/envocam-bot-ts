@@ -11,6 +11,7 @@ import {
   modelMentionsStore,
   refundEventsStore,
   activityStore,
+  settingsStore,
   type CameraModel,
 } from "../data/store.js";
 import { isAdmin, downloadFileAsBase64, sleep } from "../helpers.js";
@@ -35,7 +36,8 @@ type AdminState =
   | { step: "broadcast_text" }
   | { step: "broadcast_confirm"; text: string }
   | { step: "awaiting_sample_title" }
-  | { step: "awaiting_sample_text"; title: string };
+  | { step: "awaiting_sample_text"; title: string }
+  | { step: "awaiting_sticker_sample" };
 
 const adminState = new Map<number, AdminState>();
 function getState(uid: number): AdminState { return adminState.get(uid) || { step: "idle" }; }
@@ -427,6 +429,29 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     await showSamplesMenu(ctx);
   });
 
+  // ── Namuna rasm (barcha modellar uchun umumiy — stiker joyini ko'rsatadi) ──
+  bot.action("admin_sticker_sample", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await showStickerSampleMenu(ctx, false);
+  });
+
+  bot.action("admin_sticker_sample_add", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    setState(ctx.from.id, { step: "awaiting_sticker_sample" });
+    await ctx.editMessageText(
+      "Stiker joyi strelka/doira bilan belgilangan namuna rasmni yuboring. Bu rasm mijozga \"stikerni yaqinroq suratga oling\" deganda ko'rsatiladi.\n(Bekor — /panel)"
+    );
+  });
+
+  bot.action("admin_sticker_sample_delete", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    settingsStore.clearStickerSample();
+    await showStickerSampleMenu(ctx, false);
+  });
+
   bot.action("admin_back_main", async (ctx) => {
     if (!ctx.from || !isAdmin(ctx.from.id)) return;
     await ctx.answerCbQuery();
@@ -663,6 +688,16 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
       return;
     }
 
+    // Namuna rasm (stiker joyi ko'rsatilgan)
+    if (state.step === "awaiting_sticker_sample" && "photo" in msg && msg.photo) {
+      const photo = msg.photo[msg.photo.length - 1];
+      settingsStore.setStickerSample(photo.file_id);
+      clearState(ctx.from.id);
+      await ctx.reply("Namuna rasm saqlandi.");
+      await showStickerSampleMenu(ctx, true);
+      return;
+    }
+
     // Kontent qo'shish
     if (state.step === "adding_content") {
       const { modelName, category } = state;
@@ -697,15 +732,41 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
           await ctx.reply("Barcode raqami topilmadi. Faqat raqamlardan iborat kod(lar)ni yuboring (kamida 6 xonali).");
           return;
         }
+
+        const allModels = modelsStore.getAll();
         let added = 0;
+        const errors: string[] = [];
+        const warnings: string[] = [];
+
         for (const code of codes) {
-          if (!model.barcodes.includes(code)) {
-            model.barcodes.push(code);
-            added++;
+          // Bu barcode boshqa modelda allaqachon ro'yxatdami?
+          const conflictModel = allModels.find((m) => m.name !== model.name && m.barcodes.includes(code));
+          if (conflictModel) {
+            errors.push(`${code} — "${conflictModel.name}" modelida allaqachon bor, o'tkazib yuborildi.`);
+            continue;
           }
+          if (model.barcodes.includes(code)) continue; // allaqachon shu modelda bor
+
+          // Oxirgi 4 raqami boshqa modelning biror barcode'i bilan bir xilmi?
+          // (bu OCR "oxirgi 4 raqam" fallback'ida ikkalasini chalkashtirib
+          // qo'yishi mumkin — lekin qo'shishga baribir ruxsat beramiz.)
+          const last4 = code.slice(-4);
+          const collisionModel = allModels.find(
+            (m) => m.name !== model.name && m.barcodes.some((b) => b.slice(-4) === last4)
+          );
+          if (collisionModel) {
+            warnings.push(`${code} — oxirgi 4 raqami ("${last4}") "${collisionModel.name}" modelining barcode'i bilan bir xil. Ikkala model orasida chalkashlik bo'lishi mumkin, lekin baribir qo'shildi.`);
+          }
+
+          model.barcodes.push(code);
+          added++;
         }
         modelsStore.save(model);
-        await ctx.reply(`Saqlandi. Qo'shildi: ${added} ta. Jami: ${model.barcodes.length} ta barcode.`);
+
+        const lines = [`Saqlandi. Qo'shildi: ${added} ta. Jami: ${model.barcodes.length} ta barcode.`];
+        if (warnings.length > 0) lines.push("", "⚠️ Ogohlantirishlar:", ...warnings);
+        if (errors.length > 0) lines.push("", "❌ Qo'shilmadi:", ...errors);
+        await ctx.reply(lines.join("\n"));
         return;
       }
 
@@ -844,7 +905,8 @@ async function showMainMenu(ctx: BotContext): Promise<void> {
      Markup.button.callback("Yangi model", "admin_add_model")],
     [Markup.button.callback(`Mijozlar: ${total} ta`, "admin_clients_count"),
      Markup.button.callback("Hammaga xabar", "admin_broadcast")],
-    [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples")],
+    [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples"),
+     Markup.button.callback("Namuna rasm (stiker)", "admin_sticker_sample")],
     [Markup.button.callback("Statistika", "admin_stats")],
   ]));
 }
@@ -856,7 +918,8 @@ async function showMainMenuEdit(ctx: BotContext): Promise<void> {
      Markup.button.callback("Yangi model", "admin_add_model")],
     [Markup.button.callback(`Mijozlar: ${total} ta`, "admin_clients_count"),
      Markup.button.callback("Hammaga xabar", "admin_broadcast")],
-    [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples")],
+    [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples"),
+     Markup.button.callback("Namuna rasm (stiker)", "admin_sticker_sample")],
     [Markup.button.callback("Statistika", "admin_stats")],
   ]));
 }
@@ -910,4 +973,22 @@ async function showSamplesMenuNew(ctx: BotContext): Promise<void> {
   buttons.push([Markup.button.callback("+ Yangi namuna qo'shish", "admin_sample_add")]);
   buttons.push([Markup.button.callback("⬅️ Orqaga", "admin_samples_back")]);
   await ctx.reply(`Namuna yozishmalar: ${samples.length} ta`, Markup.inlineKeyboard(buttons));
+}
+
+async function showStickerSampleMenu(ctx: BotContext, asNew: boolean): Promise<void> {
+  const sample = settingsStore.getStickerSample();
+  const text = sample
+    ? "Namuna rasm (stiker joyini ko'rsatuvchi) mavjud.\n\nBu barcha modellar uchun umumiy — mijozga \"stikerni yaqinroq suratga oling\" deganda shu rasm yuboriladi."
+    : "Namuna rasm hali yuklanmagan.\n\nBu rasm mijozga \"stikerni yaqinroq suratga oling\" deganda ko'rsatiladi (barcha modellar uchun bitta umumiy rasm — chunki quti hamma modelda bir xil).";
+  const buttons: ReturnType<typeof Markup.button.callback>[][] = [
+    [Markup.button.callback(sample ? "Almashtirish" : "Yuklash", "admin_sticker_sample_add")],
+  ];
+  if (sample) buttons.push([Markup.button.callback("O'chirish", "admin_sticker_sample_delete")]);
+  buttons.push([Markup.button.callback("⬅️ Orqaga", "admin_back_main")]);
+  const keyboard = Markup.inlineKeyboard(buttons);
+  if (asNew) {
+    await ctx.reply(text, keyboard);
+  } else {
+    await ctx.editMessageText(text, keyboard);
+  }
 }
