@@ -43,6 +43,7 @@ export interface CameraModel {
   reviewVoiceFileId?: string;
   reviewVideoFileId?: string;
   refCollage?: RefCollageMeta;      // "Rasmlar" kategoriyasidan yasalgan taqqoslash kollaji (keshlangan)
+  barcodes: string[];               // Quti stikeridagi barcode raqam(lar)i — modelni ANIQ aniqlaydigan yagona belgi
 }
 
 // O'zbekistonning 14 hududi: 12 viloyat + Toshkent shahri (alohida) + Qoraqalpog'iston Respublikasi
@@ -139,6 +140,7 @@ export interface ClientData {
   lastModelName?: string;
   connectionMethod?: "short" | "long";
   awaitingConnectionMethod?: boolean;
+  awaitingBarcode?: boolean;
   refundRequested?: boolean;
   unsupportedMessageNoted?: boolean;
   lastInteractionDate?: string;
@@ -185,9 +187,13 @@ function loadDb(): DbShape {
       const raw = readFileSync(DATA_FILE, "utf-8");
       const parsed = JSON.parse(raw) as Partial<DbShape>;
       return {
-        // Eski ma'lumotlarda longRangeGuides maydoni bo'lmasligi mumkin
-        // (avval "Yo'riqnoma" rasm+OCR edi) — bo'sh massiv bilan boshlanadi.
-        models: (parsed.models ?? []).map((m) => ({ ...m, longRangeGuides: m.longRangeGuides ?? [] })),
+        // Eski ma'lumotlarda longRangeGuides/barcodes maydoni bo'lmasligi
+        // mumkin — bo'sh massiv bilan boshlanadi.
+        models: (parsed.models ?? []).map((m) => ({
+          ...m,
+          longRangeGuides: m.longRangeGuides ?? [],
+          barcodes: m.barcodes ?? [],
+        })),
         clients: parsed.clients ?? [],
         samples: parsed.samples ?? [],
         reports: parsed.reports ?? {},

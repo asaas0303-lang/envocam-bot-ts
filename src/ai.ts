@@ -25,21 +25,36 @@ function toImageBlock(img: ImageInput): Anthropic.ImageBlockParam {
   };
 }
 
-// Mijoz rasm(lar)ini namuna rasmlar bilan solishtirib model aniqlaydi
+// Mijoz rasm(lar)idan kamera modelini aniqlaydi. ENG ISHONCHLI belgi —
+// quti stikeridagi BARCODE raqami (model nomi qutida hech qachon
+// yozilmaydi). Barcode topilmasa/mos kelmasa, namuna rasmlar bilan vizual
+// solishtirishga o'tadi, lekin ehtiyotkorlik bilan (kameralar bir-biriga
+// juda o'xshash).
 export async function identifyModelFromImages(
   clientImages: ImageInput[],
-  models: { name: string; refCollage: ImageInput | null }[]
+  models: { name: string; barcodes: string[]; refCollage: ImageInput | null }[]
 ): Promise<{ status: "matched" | "unclear" | "no_match"; model: string | null }> {
   if (clientImages.length === 0) return { status: "unclear", model: null };
 
   const content: Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> = [];
   const modelNames = models.map((m) => m.name);
-  const withRefs = models.filter((m) => m.refCollage !== null);
 
+  const withBarcodes = models.filter((m) => m.barcodes.length > 0);
+  if (withBarcodes.length > 0) {
+    const barcodeList = withBarcodes
+      .map((m) => `Model: ${m.name} — barcode(lar): ${m.barcodes.join(", ")}`)
+      .join("\n");
+    content.push({
+      type: "text",
+      text: `Har bir modelning quti stikeridagi BARCODE raqam(lar)i — bu modelni aniqlashning ENG ISHONCHLI yo'li:\n${barcodeList}`,
+    });
+  }
+
+  const withRefs = models.filter((m) => m.refCollage !== null);
   if (withRefs.length > 0) {
     content.push({
       type: "text",
-      text: "Quyida do'kondagi kameralarning namuna rasmlari — har bir model uchun bitta rasm, unda o'sha modelning bir nechta burchakdan olingan suratlari grid (jadval) shaklida birlashtirilgan. Har bir rasm model nomi bilan belgilangan:",
+      text: "Qo'shimcha (barcode topilmasa yoki mos kelmasa ishlatiladigan) — do'kondagi kameralarning namuna rasmlari: har bir model uchun bitta rasm, unda o'sha modelning bir nechta burchakdan olingan suratlari grid (jadval) shaklida birlashtirilgan. Har bir rasm model nomi bilan belgilangan:",
     });
     const sorted = [...withRefs].sort((a, b) => a.name.localeCompare(b.name));
     for (const m of sorted) {
@@ -58,11 +73,13 @@ export async function identifyModelFromImages(
     type: "text",
     text: `Mavjud modellar: ${modelNames.join(", ")}.
 
-Vazifa:
-1. Avval mijoz rasmidagi karobka yoki kamera ustidagi YOZUVLARNI o'qi — model raqami ko'pincha karobkada yozilgan bo'ladi, bu eng ishonchli belgi.
-2. Keyin mijoz rasmini yuqoridagi namuna rasmlar bilan vizual solishtir.
-3. Bir nechta rasm bo'lsa, hammasidan foydalanib eng aniq javobni ber.
-Mos modelni topishga imkon qadar harakat qil. Faqat haqiqatan aniqlab bo'lmasa "unclear" de. Ro'yxatdagi hech bir modelga to'g'ri kelmasa "no_match" de.
+MUHIM KONTEKST: Bu kameralarning qutisida MODEL NOMI hech qachon yozilmaydi — quti stikerida faqat "CAMERA / HD VIDEO CAMERA" umumiy yozuvi va BARCODE raqami bor, "Model:" maydoni bo'sh qoldirilgan. Kameralarning o'zi (kichik WiFi kameralar) bir-biriga juda o'xshash, shuning uchun faqat tashqi ko'rinishga tayanib xulosa chiqarish ko'pincha noto'g'ri bo'ladi.
+
+VAZIFA (shu tartibda bajar):
+1. Avval mijoz rasmidagi BARCHA raqamlarni diqqat bilan o'qi — ayniqsa stikerda (ko'pincha vertikal yozilgan) uzun raqamni (masalan 1000077693951 kabi 10+ xonali raqam).
+2. O'qilgan raqamlardan birortasi yuqoridagi barcode ro'yxatidagi biror modelga ANIQ (raqam-raqam) mos kelsa — "matched" de va o'sha modelni qaytar. Bu ENG ISHONCHLI usul, shunga ustunlik ber.
+3. Agar barcode o'qilmasa yoki ro'yxatdagi hech biriga mos kelmasa — namuna rasmlar bilan vizual solishtir, LEKIN faqat juda ishonchli bo'lsang "matched" de. Kameralar bir-biriga o'xshash bo'lgani uchun ozgina shubhang bo'lsa "unclear" de — noto'g'ri taxmin qilishdan ko'ra "unclear" deyish yaxshiroq.
+Ro'yxatdagi hech bir modelga to'g'ri kelmasa "no_match" de.
 Faqat JSON qaytar: {"status": "matched|unclear|no_match", "model": "nom yoki null"}`,
   });
 
@@ -80,6 +97,59 @@ Faqat JSON qaytar: {"status": "matched|unclear|no_match", "model": "nom yoki nul
     return JSON.parse(jsonMatch[0]) as { status: "matched" | "unclear" | "no_match"; model: string | null };
   } catch {
     return { status: "no_match", model: null };
+  }
+}
+
+// ─── Rasm turini aniqlash (kamera/quti / ilova skrinshoti / qo'llanma / boshqa) ──
+
+export interface ImageClassification {
+  kind: "camera_or_box" | "app_screenshot" | "manual_page" | "other";
+  description: string;
+}
+
+// Mijoz kamera/quti o'rniga ko'pincha ilova skrinshoti yoki qo'llanma
+// varag'ini yuboradi — bularni model-aniqlashga tiqishtirish behuda va
+// chalkash javobga olib keladi. Shu funksiya bilan avval rasm turini
+// bilib olamiz.
+export async function classifyImage(image: ImageInput): Promise<ImageClassification> {
+  const response = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 128,
+    messages: [
+      {
+        role: "user",
+        content: [
+          toImageBlock(image),
+          {
+            type: "text",
+            text: `Bu rasmda aynan nima ko'rinayotganini aniqla.
+
+Faqat JSON qaytar: {"kind": "camera_or_box|app_screenshot|manual_page|other", "description": "rasmda aynan nima ko'rinayotgani, 1 qisqa jumla"}
+
+- camera_or_box: kameraning o'zi va/yoki uning qutisi (stiker, barcode va h.k.)
+- app_screenshot: telefon ilovasi ekrani (QR kod, sozlamalar, xato xabari va h.k.)
+- manual_page: bosma yo'riqnoma/qog'oz varag'i surati
+- other: yuqoridagilarga mos kelmaydigan boshqa narsa`,
+          },
+        ],
+      },
+    ],
+  });
+
+  const fallback: ImageClassification = { kind: "other", description: "" };
+  const block = response.content[0];
+  if (block.type !== "text") return fallback;
+  try {
+    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return fallback;
+    const parsed = JSON.parse(jsonMatch[0]) as { kind?: string; description?: string };
+    const validKinds = ["camera_or_box", "app_screenshot", "manual_page", "other"];
+    const kind = validKinds.includes(parsed.kind ?? "")
+      ? (parsed.kind as ImageClassification["kind"])
+      : "other";
+    return { kind, description: parsed.description?.trim() ?? "" };
+  } catch {
+    return fallback;
   }
 }
 

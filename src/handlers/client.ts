@@ -14,12 +14,21 @@ import {
 import {
   detectLanguage,
   isAdmin,
+  getAdminIds,
   downloadFileAsBase64,
   randomDelay,
   sendSplitMessages,
   sleep,
 } from "../helpers.js";
-import { identifyModelFromImages, detectIntent, answerQuestion, classifyProductFeedback, classifyRegion } from "../ai.js";
+import {
+  identifyModelFromImages,
+  detectIntent,
+  answerQuestion,
+  classifyProductFeedback,
+  classifyRegion,
+  classifyImage,
+  type ImageClassification,
+} from "../ai.js";
 import { getModelCollage } from "../collage.js";
 import type { ClientFeedback } from "../data/store.js";
 import { logger } from "../lib/logger.js";
@@ -149,6 +158,15 @@ async function processIncomingMessage(
       runSerialized(chatId, () =>
         handleConnectionMethodAnswer(ctx, client, text, businessConnectionId).catch(async (err) => {
           logger.error({ err, chatId }, "handleConnectionMethodAnswer failed");
+          await sendFallbackError(ctx, client, businessConnectionId);
+        })
+      );
+      return;
+    }
+    if (client.awaitingBarcode) {
+      runSerialized(chatId, () =>
+        handleBarcodeAnswer(ctx, client, text, businessConnectionId).catch(async (err) => {
+          logger.error({ err, chatId }, "handleBarcodeAnswer failed");
           await sendFallbackError(ctx, client, businessConnectionId);
         })
       );
@@ -389,6 +407,12 @@ function askForCameraPhotoText(language: ClientData["language"]): string {
     : "Чтобы помочь точнее — пришлите фото вашей камеры.";
 }
 
+function askForBarcodeText(language: ClientData["language"]): string {
+  return language !== "ru"
+    ? "Kamerangizni aniqlash uchun qutidagi oq stikerda yozilgan raqamni (masalan 1000077693951) yuboring. Yoki qutini stiker aniq ko'rinadigan qilib qayta suratga oling."
+    : "Чтобы определить камеру, отправьте номер с белого стикера на коробке (например 1000077693951). Или сфотографируйте коробку так, чтобы стикер было хорошо видно.";
+}
+
 // Qisqa masofa — mavjud video yo'riqnomalarni ketma-ket yuboradi (avvalgi xatti-harakat o'zgarmagan)
 async function sendShortRangeGuide(
   ctx: BotContext,
@@ -460,6 +484,22 @@ async function deliverConnectionGuide(
   }
 }
 
+// Model aniqlangandan keyin (rasm orqali yoki barcode orqali) ishlatiladi:
+// ulash usuli hali noma'lum bo'lsa so'raydi, aks holda darhol yo'riqnoma beradi.
+async function askConnectionMethodOrDeliver(
+  ctx: BotContext,
+  client: ClientData,
+  businessConnectionId?: string
+): Promise<void> {
+  if (!client.connectionMethod) {
+    client.awaitingConnectionMethod = true;
+    clientsStore.save(client);
+    await sendMsg(ctx, client.chatId, connectionMethodQuestion(client.language), businessConnectionId);
+  } else {
+    await deliverConnectionGuide(ctx, client, businessConnectionId);
+  }
+}
+
 // Mijoz "kamerani ulashga yordam bering" desa (model va/yoki usul hali noma'lum bo'lishi mumkin)
 async function handleConnectCameraRequest(
   ctx: BotContext,
@@ -515,6 +555,102 @@ async function handleConnectionMethodAnswer(
   }
 
   await deliverConnectionGuide(ctx, client, businessConnectionId);
+}
+
+// ─── Barcode orqali model aniqlash ─────────────────────────────────────────────
+
+// Bir xil mijoz-barcode juftligi uchun adminlarga faqat bir marta xabar
+// beramiz — qayta-qayta bezovta qilmaslik uchun (jarayon ishga tushgan
+// vaqt davomida, disk ga saqlanmaydi).
+const notifiedUnknownBarcodes = new Set<string>();
+
+async function notifyAdminsUnknownBarcode(
+  ctx: BotContext,
+  barcode: string,
+  client: ClientData
+): Promise<void> {
+  const key = `${client.chatId}:${barcode}`;
+  if (notifiedUnknownBarcodes.has(key)) return;
+  notifiedUnknownBarcodes.add(key);
+
+  const text =
+    `⚠️ Mijoz noma'lum barcode yubordi: ${barcode}\n` +
+    `Mijoz: ${client.firstName ?? client.chatId}\n\n` +
+    `Agar bu haqiqiy EnvoCam kamerasi bo'lsa, shu barcode'ni tegishli modelga /panel orqali qo'shing.`;
+
+  for (const adminId of getAdminIds()) {
+    try {
+      await ctx.telegram.sendMessage(adminId, text);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+// "awaitingBarcode" holatida kelgan javobni tekshiradi — mijoz quti
+// stikeridagi barcode raqamini yozgan bo'lishi kerak (kamida 8 xonali).
+async function handleBarcodeAnswer(
+  ctx: BotContext,
+  client: ClientData,
+  text: string,
+  businessConnectionId?: string
+): Promise<void> {
+  const chatId = client.chatId;
+  const digits = text.replace(/\D/g, "");
+
+  if (digits.length < 8) {
+    // Raqam emas yoki juda qisqa — barcode javobi sifatida qabul qilmaymiz,
+    // oddiy savol sifatida ishlov beramiz.
+    client.awaitingBarcode = false;
+    clientsStore.save(client);
+    await handleText(ctx, client, text, businessConnectionId);
+    return;
+  }
+
+  client.awaitingBarcode = false;
+
+  const matchedModel = modelsStore.getAll().find((m) => m.barcodes.includes(digits));
+
+  if (matchedModel) {
+    client.lastModelName = matchedModel.name;
+    client.hasGreeted = true;
+    client.lastInteractionDate = todayStr();
+    clientsStore.save(client);
+    modelMentionsStore.record(matchedModel.name, client.chatId);
+    await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
+    return;
+  }
+
+  // Barcode ro'yxatda topilmadi — adminni xabardor qilamiz va mijozga
+  // jim qolmasdan umumiy yordam beramiz.
+  clientsStore.save(client);
+  await notifyAdminsUnknownBarcode(ctx, digits, client);
+
+  const samples = samplesStore.getAll().map((s) => s.text);
+  await randomDelay(15000, 50000);
+  const question = `Mijoz kamera qutisidagi barcode raqamini yubordi: ${digits}. Bu raqam hozircha bizning ro'yxatda yo'q.`;
+  const reply = await answerQuestion({
+    question,
+    language: client.language,
+    cameraModel: undefined,
+    connectionMethod: client.connectionMethod,
+    refundRequested: client.refundRequested,
+    firstName: client.firstName,
+    shouldGreet: false,
+    history: client.messageHistory || [],
+    samples,
+  });
+
+  addToHistory(client, "user", text);
+  addToHistory(client, "assistant", reply);
+  client.lastInteractionDate = todayStr();
+  clientsStore.save(client);
+
+  const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
+  for (const part of parts) {
+    await sendMsg(ctx, chatId, part, businessConnectionId);
+    if (parts.length > 1) await sleep(800);
+  }
 }
 
 // ─── Muammo/istak statistikasi ────────────────────────────────────────────────
@@ -674,6 +810,54 @@ async function handleUnsupportedMessage(
   await sendMsg(ctx, client.chatId, reply, businessConnectionId);
 }
 
+// ─── Kamera/quti bo'lmagan rasmlar (ilova skrinshoti, qo'llanma va h.k.) ──────
+
+// Mijoz ko'pincha kamera/quti o'rniga ilova skrinshoti yoki qo'llanma
+// varag'ini yuboradi — buni model-aniqlashga tiqishtirish behuda va
+// chalkash javobga olib keladi. Shu holatda rasm mazmuniga qarab to'g'ridan
+// to'g'ri savol-javob rejimiga o'tamiz.
+async function handleNonCameraPhoto(
+  ctx: BotContext,
+  client: ClientData,
+  classification: ImageClassification,
+  caption: string | undefined,
+  businessConnectionId?: string
+): Promise<void> {
+  const chatId = client.chatId;
+  const cameraModel = client.lastModelName ? modelsStore.getByName(client.lastModelName) : undefined;
+  const samples = samplesStore.getAll().map((s) => s.text);
+
+  const question = caption
+    ? `${caption}\n\n(Mijoz rasm ham yubordi: ${classification.description})`
+    : `Mijoz rasm yubordi (kamera yoki uning qutisi emas): ${classification.description}`;
+
+  await randomDelay(15000, 50000);
+
+  const reply = await answerQuestion({
+    question,
+    language: client.language,
+    cameraModel,
+    connectionMethod: client.connectionMethod,
+    refundRequested: client.refundRequested,
+    firstName: client.firstName,
+    shouldGreet: false,
+    history: client.messageHistory || [],
+    samples,
+  });
+
+  addToHistory(client, "user", question);
+  addToHistory(client, "assistant", reply);
+  client.hasGreeted = true;
+  client.lastInteractionDate = todayStr();
+  clientsStore.save(client);
+
+  const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
+  for (const part of parts) {
+    await sendMsg(ctx, chatId, part, businessConnectionId);
+    if (parts.length > 1) await sleep(800);
+  }
+}
+
 // ─── Rasmlar ─────────────────────────────────────────────────────────────────
 
 async function handlePhotos(
@@ -715,9 +899,19 @@ async function handlePhotos(
     }
   }
 
+  // Avval rasm turini aniqlaymiz — mijoz ko'pincha kamera/quti o'rniga
+  // ilova skrinshoti yoki qo'llanma varag'i yuboradi. Bunday holda katta
+  // (barcha modellar bo'yicha) model-aniqlash chaqiruvini umuman qilmaymiz —
+  // bu ham xarajatni tejaydi, ham mijozga to'g'ri javob beradi.
+  const classification = await classifyImage(clientImages[0]!);
+  if (classification.kind !== "camera_or_box") {
+    await handleNonCameraPhoto(ctx, client, classification, caption, businessConnectionId);
+    return;
+  }
+
   const modelRefs = [];
   for (const m of models) {
-    modelRefs.push({ name: m.name, refCollage: await getModelCollage(ctx, m) });
+    modelRefs.push({ name: m.name, barcodes: m.barcodes, refCollage: await getModelCollage(ctx, m) });
   }
 
   await randomDelay(25000, 70000);
@@ -731,30 +925,16 @@ async function handlePhotos(
     client.lastInteractionDate = todayStr();
     clientsStore.save(client);
     modelMentionsStore.record(result.model, client.chatId);
-
-    if (!client.connectionMethod) {
-      client.awaitingConnectionMethod = true;
-      clientsStore.save(client);
-      await sendMsg(ctx, chatId, connectionMethodQuestion(client.language), businessConnectionId);
-    } else {
-      await deliverConnectionGuide(ctx, client, businessConnectionId);
-    }
-
-  } else if (result.status === "unclear") {
-    if (!client.askedForPhotoOnce) {
-      client.askedForPhotoOnce = true;
-      clientsStore.save(client);
-      const msg = client.language !== "ru"
-        ? "Yorug' joyda, model yozuvi ko'rinadigan qilib qayta rasm yuboring."
-        : "Пожалуйста, сделайте фото в светлом месте, чтобы была видна модель.";
-      await sendMsg(ctx, chatId, msg, businessConnectionId);
-    }
-  } else {
-    const msg = client.language !== "ru"
-      ? "Bu kamera uchun qo'llanma tez orada tayyorlanadi, biroz sabr qiling."
-      : "Руководство для этой камеры скоро будет готово, подождите немного.";
-    await sendMsg(ctx, chatId, msg, businessConnectionId);
+    await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
+    return;
   }
+
+  // unclear yoki no_match — ikkalasida ham quti stikeridagi barcode
+  // raqamini so'raymiz, chunki qutida model nomi umuman yozilmagan va
+  // vizual solishtirish yetarli emas.
+  client.awaitingBarcode = true;
+  clientsStore.save(client);
+  await sendMsg(ctx, chatId, askForBarcodeText(client.language), businessConnectionId);
 }
 
 // ─── Matn ─────────────────────────────────────────────────────────────────────

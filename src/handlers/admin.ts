@@ -47,6 +47,7 @@ function clearState(uid: number): void { adminState.set(uid, { step: "idle" }); 
 const CAT_LABELS: Record<string, string> = {
   images: "Rasmlar", manual: "Yo'riqnoma (uzoq masofa)", app: "Ilova",
   video: "Video (qisqa masofa)", review_voice: "Sharh ovoz", review_video: "Sharh video",
+  barcodes: "Barcode raqamlari",
 };
 const CAT_INSTRUCTIONS: Record<string, string> = {
   images: "Rasm yuboring.",
@@ -55,6 +56,7 @@ const CAT_INSTRUCTIONS: Record<string, string> = {
   video: "Video yuboring.",
   review_voice: "Sharh uchun ovozli xabar yuboring.",
   review_video: "Sharh uchun video yuboring.",
+  barcodes: "Quti stikeridagi barcode raqamini yuboring (masalan: 1000077693951). Bir nechta bo'lsa, har birini alohida qatorga yozib, bitta xabarda yuborishingiz mumkin.",
 };
 
 function getCategoryCount(model: CameraModel | undefined, category: string): number {
@@ -65,6 +67,7 @@ function getCategoryCount(model: CameraModel | undefined, category: string): num
   if (category === "video") return model.videoGuides.length;
   if (category === "review_voice") return model.reviewVoiceFileId ? 1 : 0;
   if (category === "review_video") return model.reviewVideoFileId ? 1 : 0;
+  if (category === "barcodes") return model.barcodes.length;
   return 0;
 }
 
@@ -93,10 +96,11 @@ function buildCategoryKeyboard(modelName: string, category: string) {
       category === "images" ? model?.images ?? [] :
       category === "manual" ? model?.longRangeGuides ?? [] :
       category === "app" ? model?.appScreenshots ?? [] :
-      category === "video" ? model?.videoGuides ?? [] : [];
+      category === "video" ? model?.videoGuides ?? [] :
+      category === "barcodes" ? model?.barcodes ?? [] : [];
 
-    (items as Array<{ caption?: string; extractedText?: string; text?: string }>).forEach((item, i) => {
-      const label = short(item.caption || item.extractedText || item.text, 26);
+    (items as Array<{ caption?: string; extractedText?: string; text?: string } | string>).forEach((item, i) => {
+      const label = typeof item === "string" ? short(item, 26) : short(item.caption || item.extractedText || item.text, 26);
       buttons.push([
         Markup.button.callback(`${i + 1}. ${label}`, "admin_noop"),
         Markup.button.callback("O'chirish", `admin_item_del_${modelName}__${category}__${i}`),
@@ -518,6 +522,7 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
       else if (category === "video") model.videoGuides.splice(idx, 1);
       else if (category === "review_voice") model.reviewVoiceFileId = undefined;
       else if (category === "review_video") model.reviewVideoFileId = undefined;
+      else if (category === "barcodes") model.barcodes.splice(idx, 1);
       modelsStore.save(model);
     }
 
@@ -613,7 +618,7 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
       const name = msg.text.trim();
       if (!name || name.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
       if (modelsStore.getByName(name)) { await ctx.reply(`"${name}" allaqachon bor. Boshqa nom:`); return; }
-      modelsStore.save({ name, images: [], appScreenshots: [], videoGuides: [], longRangeGuides: [] });
+      modelsStore.save({ name, images: [], appScreenshots: [], videoGuides: [], longRangeGuides: [], barcodes: [] });
       clearState(ctx.from.id);
       await ctx.reply(`"${name}" modeli qo'shildi.`);
       await showModelMenuNew(ctx, name);
@@ -679,6 +684,28 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
           modelsStore.save(model);
           await ctx.reply(`Saqlandi. Jami: ${model.longRangeGuides.length} ta uzoq masofa yo'riqnomasi.`);
         }
+        return;
+      }
+
+      if (category === "barcodes" && "text" in msg && msg.text) {
+        const raw = msg.text.trim();
+        const codes = raw
+          .split(/[\s,;]+/)
+          .map((c) => c.trim())
+          .filter((c) => c.length >= 6 && /^\d+$/.test(c));
+        if (codes.length === 0) {
+          await ctx.reply("Barcode raqami topilmadi. Faqat raqamlardan iborat kod(lar)ni yuboring (kamida 6 xonali).");
+          return;
+        }
+        let added = 0;
+        for (const code of codes) {
+          if (!model.barcodes.includes(code)) {
+            model.barcodes.push(code);
+            added++;
+          }
+        }
+        modelsStore.save(model);
+        await ctx.reply(`Saqlandi. Qo'shildi: ${added} ta. Jami: ${model.barcodes.length} ta barcode.`);
         return;
       }
 
@@ -840,6 +867,7 @@ function buildModelKeyboard(modelName: string) {
   const rv = model?.reviewVoiceFileId ? "bor" : "yo'q";
   const rvid = model?.reviewVideoFileId ? "bor" : "yo'q";
   return Markup.inlineKeyboard([
+    [Markup.button.callback(`🔑 Barcode raqamlari (${c("barcodes")})`, `admin_cat_${modelName}__barcodes`)],
     [Markup.button.callback(`Rasmlar (${c("images")})`, `admin_cat_${modelName}__images`),
      Markup.button.callback(`Yo'riqnoma-uzoq (${c("manual")})`, `admin_cat_${modelName}__manual`)],
     [Markup.button.callback(`Ilova (${c("app")})`, `admin_cat_${modelName}__app`),
