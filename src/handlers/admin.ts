@@ -1,6 +1,8 @@
 import { Telegraf, Markup } from "telegraf";
+import { existsSync } from "fs";
 import type { BotContext } from "../types.js";
 import {
+  DATA_DIR,
   modelsStore,
   clientsStore,
   samplesStore,
@@ -13,7 +15,7 @@ import {
 } from "../data/store.js";
 import { isAdmin, downloadFileAsBase64, sleep } from "../helpers.js";
 import { extractTextFromImage, analyzeInsights } from "../ai.js";
-import { COLLAGE_MAX_IMAGES } from "../collage.js";
+import { COLLAGE_MAX_IMAGES, rebuildModelCollageForDiagnostics } from "../collage.js";
 import { sendReportNow } from "../tasks.js";
 import {
   formatRegionStats,
@@ -138,6 +140,71 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
       ? `Joriy commit: ${sha.slice(0, 7)}\nTo'liq: ${sha}`
       : "RAILWAY_GIT_COMMIT_SHA topilmadi (lokal muhitda ishlayapsizmi?).";
     await ctx.reply(msg);
+  });
+
+  // Diagnostika: model rasm-aniqlash bilan bog'liq muammolarni tekshirish uchun.
+  // /diag — umumiy holat. /diag <model nomi> — shu model uchun batafsil va
+  // kollajni qaytadan yasashga urinib ko'radi (xato bo'lsa aniq sababini ko'rsatadi).
+  bot.command("diag", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+
+    const rawText = ("text" in ctx.message ? ctx.message.text : "") as string;
+    const modelNameArg = rawText.replace(/^\/diag(@\S+)?\s*/i, "").trim();
+
+    const volumeMounted = !!process.env["RAILWAY_VOLUME_MOUNT_PATH"];
+    const models = modelsStore.getAll();
+
+    const generalLines = [
+      `DATA_DIR: ${DATA_DIR}`,
+      `RAILWAY_VOLUME_MOUNT_PATH: ${volumeMounted ? "bor (Volume ulangan)" : "yo'q (doimiy bo'lmagan papka ishlatilyapti)"}`,
+      `Jami modellar: ${models.length} ta`,
+    ];
+
+    if (!modelNameArg) {
+      generalLines.push("", "Model haqida batafsil ma'lumot uchun: /diag <model nomi>  (masalan: /diag A9)");
+      await ctx.reply(generalLines.join("\n"));
+      return;
+    }
+
+    await ctx.reply(generalLines.join("\n"));
+
+    const model = models.find((m) => m.name.toLowerCase() === modelNameArg.toLowerCase());
+    if (!model) {
+      const names = models.map((m) => m.name).join(", ") || "(hech qanday model yo'q)";
+      await ctx.reply(`"${modelNameArg}" nomli model topilmadi.\nMavjud modellar: ${names}`);
+      return;
+    }
+
+    const imageLines = model.images.map((img, i) => `${i + 1}. ${img.file_id.slice(0, 20)}...`);
+    const collageInfo = model.refCollage
+      ? [
+          `sourceHash: ${model.refCollage.sourceHash}`,
+          `generatedAt: ${model.refCollage.generatedAt}`,
+          `path: ${model.refCollage.path}`,
+          `Diskda mavjud: ${existsSync(model.refCollage.path) ? "ha" : "YO'Q"}`,
+        ].join("\n")
+      : "mavjud emas (hali hech qachon yasalmagan)";
+
+    await ctx.reply(
+      `Model: ${model.name}\n` +
+      `Rasmlar soni: ${model.images.length} ta\n\n` +
+      `file_id lar:\n${imageLines.length > 0 ? imageLines.join("\n") : "(rasm yo'q)"}\n\n` +
+      `refCollage:\n${collageInfo}`
+    );
+
+    await ctx.reply("Kollajni hozir qayta yasashga urinilmoqda...");
+    try {
+      const result = await rebuildModelCollageForDiagnostics(ctx, model);
+      if (result) {
+        const sizeKb = Math.round((result.base64.length * 0.75) / 1024);
+        await ctx.reply(`✅ Kollaj muvaffaqiyatli yasaldi. Taxminiy hajmi: ${sizeKb} KB.`);
+      } else {
+        await ctx.reply("⚠️ Kollaj yasalmadi (rasm topilmadi), lekin aniq xatolik ham chiqmadi.");
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await ctx.reply(`❌ Kollaj yasashda xatolik:\n${message}`);
+    }
   });
 
   bot.command("hisobot", async (ctx) => {
