@@ -1,4 +1,4 @@
-import { REGIONS, type ActivityEvent, type ClientData, type IssueCategory, type ModelMention, type RefundEvent } from "./data/store.js";
+import { REGIONS, type ActivityEvent, type ApiBalance, type ClientData, type IssueCategory, type ModelMention, type RefundEvent, type UsageRecord } from "./data/store.js";
 
 export function formatRegionStats(clients: ClientData[]): string {
   const counts = new Map<string, number>();
@@ -271,4 +271,84 @@ export function formatNewVsReturningPerWeek(
   }
 
   return `Haftalik yangi/qaytgan mijozlar (Dushanbadan boshlab):\n\n${lines.join("\n")}`;
+}
+
+// ─── API xarajat hisoboti ────────────────────────────────────────────────────
+
+function tashkentDateStrFor(date: Date): string {
+  return new Date(date.getTime() + TASHKENT_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+function dailyCostFor(usage: UsageRecord[], dateStr: string): number {
+  return usage.filter((u) => u.date === dateStr).reduce((s, u) => s + u.costUsd, 0);
+}
+
+function last7DaysCosts(usage: UsageRecord[]): { date: string; cost: number }[] {
+  const out: { date: string; cost: number }[] = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = tashkentDateStrFor(new Date(Date.now() - i * 24 * 60 * 60 * 1000));
+    out.push({ date: d, cost: dailyCostFor(usage, d) });
+  }
+  return out;
+}
+
+// /xarajat buyrug'i uchun to'liq hisobot.
+export function formatCostReport(usage: UsageRecord[], balance: ApiBalance | undefined): string {
+  const todayStr = tashkentDateStrFor(new Date());
+  const todayRecords = usage.filter((u) => u.date === todayStr);
+  const todayCost = todayRecords.reduce((s, u) => s + u.costUsd, 0);
+
+  const week = last7DaysCosts(usage);
+  const avgDaily = week.reduce((s, d) => s + d.cost, 0) / week.length;
+  const totalCost = usage.reduce((s, u) => s + u.costUsd, 0);
+
+  const byFn = new Map<string, number>();
+  for (const u of usage) byFn.set(u.fn, (byFn.get(u.fn) ?? 0) + u.costUsd);
+  const topFn = [...byFn.entries()].sort((a, b) => b[1] - a[1])[0];
+
+  const daysLeft = balance && avgDaily > 0 ? Math.floor(balance.amountUsd / avgDaily) : null;
+
+  const lines = [
+    "API xarajat hisoboti:",
+    "",
+    `Bugungi sarf: $${todayCost.toFixed(3)} (${todayRecords.length} ta so'rov)`,
+    "",
+    "Oxirgi 7 kun:",
+    ...week.map((d) => `${d.date}: $${d.cost.toFixed(3)}`),
+    "",
+    `Jami sarf (boshidan): $${totalCost.toFixed(2)}`,
+    balance
+      ? `Qolgan taxminiy balans: ~$${balance.amountUsd.toFixed(2)} (oxirgi kiritilgan: ${new Date(balance.setAt).toLocaleDateString("uz-UZ")})`
+      : `Balans hali kiritilmagan (Admin panel → "API balans").`,
+    `O'rtacha kunlik sarf (oxirgi 7 kun): $${avgDaily.toFixed(3)}`,
+    daysLeft !== null
+      ? `Taxminan yetadi: ${daysLeft} kunga`
+      : "Taxminan necha kunga yetishi: hisoblash uchun ma'lumot yetarli emas",
+  ];
+
+  if (topFn) {
+    lines.push("", `Eng ko'p sarflaydigan funksiya: ${topFn[0]} — $${topFn[1].toFixed(2)}`);
+  }
+
+  return lines.join("\n");
+}
+
+// Kunlik 21:00 avtomatik xabar uchun — qisqaroq shakl.
+export function formatDailyCostSummary(usage: UsageRecord[], balance: ApiBalance | undefined): string {
+  const todayStr = tashkentDateStrFor(new Date());
+  const todayRecords = usage.filter((u) => u.date === todayStr);
+  const todayCost = todayRecords.reduce((s, u) => s + u.costUsd, 0);
+
+  const week = last7DaysCosts(usage);
+  const avgDaily = week.reduce((s, d) => s + d.cost, 0) / week.length;
+  const daysLeft = balance && avgDaily > 0 ? Math.floor(balance.amountUsd / avgDaily) : null;
+
+  const lines = [
+    `Bugungi API sarf: $${todayCost.toFixed(2)} (${todayRecords.length} ta so'rov)`,
+    balance ? `Qolgan balans: ~$${balance.amountUsd.toFixed(2)}` : "Balans hali kiritilmagan.",
+  ];
+  if (daysLeft !== null) {
+    lines.push(`O'rtacha kunlik: $${avgDaily.toFixed(2)} → taxminan ${daysLeft} kunga yetadi`);
+  }
+  return lines.join("\n");
 }

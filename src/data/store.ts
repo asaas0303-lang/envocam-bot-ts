@@ -164,6 +164,7 @@ interface CachedInsights {
 
 interface ReportsMeta {
   lastReportDate?: string;
+  lastCostReportDate?: string;
   cachedInsights?: CachedInsights;
 }
 
@@ -173,6 +174,38 @@ export interface StickerSample {
 
 interface AppSettings {
   stickerSample?: StickerSample; // barcha modellar uchun umumiy — quti stikeri joyini ko'rsatuvchi namuna rasm
+}
+
+// Anthropic API'da qolgan kredit balansini o'qish uchun ochiq endpoint yo'q —
+// shuning uchun bot har bir chaqiruv narxini o'zi hisoblab, admin kiritgan
+// boshlang'ich balansdan ayirib boradi (taxminiy, aniq emas).
+export interface ApiBalance {
+  amountUsd: number;
+  setAt: string;          // admin oxirgi marta shu summani kiritgan sana (ISO)
+  lowAlertSent?: boolean;      // $1 dan past ogohlantirish yuborilganmi (balans qayta kiritilsa reset bo'ladi)
+  criticalAlertSent?: boolean; // $0.20 dan past ogohlantirish yuborilganmi
+}
+
+export type AiFunctionName =
+  | "readBarcodeDigits"
+  | "identifyModelFromImages"
+  | "classifyImage"
+  | "detectIntent"
+  | "answerQuestion"
+  | "classifyProductFeedback"
+  | "classifyRegion"
+  | "analyzeInsights"
+  | "analyzeFeedback"
+  | "extractTextFromImage";
+
+export interface UsageRecord {
+  date: string;    // YYYY-MM-DD, Toshkent vaqti bo'yicha
+  fn: AiFunctionName;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  costUsd: number;
+  timestamp: string; // ISO
 }
 
 interface DbShape {
@@ -185,12 +218,14 @@ interface DbShape {
   refundEvents: RefundEvent[];
   activityLog: ActivityEvent[];
   settings: AppSettings;
+  usage: UsageRecord[];
+  apiBalance?: ApiBalance;
 }
 
 function emptyDb(): DbShape {
   return {
     models: [], clients: [], samples: [], reports: {}, issues: [], modelMentions: [],
-    refundEvents: [], activityLog: [], settings: {},
+    refundEvents: [], activityLog: [], settings: {}, usage: [],
   };
 }
 
@@ -215,6 +250,8 @@ function loadDb(): DbShape {
         refundEvents: parsed.refundEvents ?? [],
         activityLog: parsed.activityLog ?? [],
         settings: parsed.settings ?? {},
+        usage: parsed.usage ?? [],
+        apiBalance: parsed.apiBalance,
       };
     } catch {
       return emptyDb();
@@ -298,6 +335,10 @@ export const reportsStore = {
     db.reports.lastReportDate = date;
     persist();
   },
+  setLastCostReportDate(date: string): void {
+    db.reports.lastCostReportDate = date;
+    persist();
+  },
 };
 
 export const issuesStore = {
@@ -358,5 +399,33 @@ export const settingsStore = {
   clearStickerSample(): void {
     db.settings.stickerSample = undefined;
     persist();
+  },
+};
+
+export const usageStore = {
+  getAll(): UsageRecord[] {
+    return db.usage;
+  },
+  // Har bir Anthropic API chaqiruvidan keyin chaqiriladi — token/narxni
+  // qayd etadi va (balans kiritilgan bo'lsa) shundan ayirib boradi.
+  record(rec: Omit<UsageRecord, "timestamp">): void {
+    db.usage.push({ ...rec, timestamp: new Date().toISOString() });
+    if (db.apiBalance) db.apiBalance.amountUsd -= rec.costUsd;
+    persist();
+  },
+  getBalance(): ApiBalance | undefined {
+    return db.apiBalance;
+  },
+  // Admin balansni (qayta) kiritganda — ogohlantirish bayroqlari ham
+  // tozalanadi, shunda to'ldirilgandan keyin ogohlantirish yana ishlaydi.
+  setBalance(amountUsd: number): void {
+    db.apiBalance = { amountUsd, setAt: new Date().toISOString(), lowAlertSent: false, criticalAlertSent: false };
+    persist();
+  },
+  markLowAlertSent(): void {
+    if (db.apiBalance) { db.apiBalance.lowAlertSent = true; persist(); }
+  },
+  markCriticalAlertSent(): void {
+    if (db.apiBalance) { db.apiBalance.criticalAlertSent = true; persist(); }
   },
 };

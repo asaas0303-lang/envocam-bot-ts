@@ -28,6 +28,23 @@ export function isAdmin(userId: number | string): boolean {
   return getAdminIds().includes(String(userId));
 }
 
+// ai.ts kabi bot/ctx obyektiga ega bo'lmagan modullardan ham adminlarga
+// to'g'ridan-to'g'ri Telegram Bot API orqali xabar yuborish uchun.
+export async function notifyAdmins(text: string): Promise<void> {
+  const token = process.env["BOT_TOKEN"] || process.env["TELEGRAM_BOT_TOKEN"];
+  if (!token) return;
+  for (const adminId of getAdminIds()) {
+    try {
+      await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+        chat_id: adminId,
+        text,
+      });
+    } catch {
+      // adminga yetkazib bo'lmasa ham botning asosiy oqimi to'xtamasin
+    }
+  }
+}
+
 export async function downloadFileAsBase64(
   ctx: Context,
   fileId: string

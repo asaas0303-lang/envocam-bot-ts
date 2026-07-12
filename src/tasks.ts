@@ -1,7 +1,9 @@
 import type { Telegraf } from "telegraf";
 import type { BotContext } from "./types.js";
-import { clientsStore, modelsStore, reportsStore } from "./data/store.js";
+import { clientsStore, modelsStore, reportsStore, usageStore } from "./data/store.js";
 import { analyzeFeedback } from "./ai.js";
+import { formatDailyCostSummary } from "./stats.js";
+import { getAdminIds } from "./helpers.js";
 import { logger } from "./lib/logger.js";
 
 const REVIEW_DELAY_MS = 10 * 60 * 60 * 1000;    // 10 soat
@@ -13,6 +15,7 @@ export function startBackgroundTasks(bot: Telegraf<BotContext>): void {
   setInterval(() => checkConnectionFollowups(bot), 5 * 60 * 1000);
   setInterval(() => checkFeedbackCollection(bot), 20 * 60 * 1000);
   setInterval(() => checkWeeklyReport(bot), 60 * 60 * 1000);
+  setInterval(() => checkDailyCostReport(bot), 15 * 60 * 1000);
 }
 
 // ─── Sharh yuborish ───────────────────────────────────────────────────────────
@@ -156,6 +159,32 @@ async function checkWeeklyReport(bot: Telegraf<BotContext>): Promise<void> {
   for (const adminId of adminIds) {
     try {
       await bot.telegram.sendMessage(adminId, reportText);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+// ─── Kunlik API xarajat hisoboti (soat 21:00, Toshkent vaqti) ─────────────────
+
+async function checkDailyCostReport(bot: Telegraf<BotContext>): Promise<void> {
+  const nowUTC5 = new Date(Date.now() + 5 * 60 * 60 * 1000);
+  const hour = nowUTC5.getUTCHours();
+  if (hour !== 21) return;
+
+  const todayStr = nowUTC5.toISOString().slice(0, 10);
+  const meta = reportsStore.getMeta();
+  if (meta.lastCostReportDate === todayStr) return; // bugun allaqachon yuborilgan
+
+  reportsStore.setLastCostReportDate(todayStr);
+
+  const adminIds = getAdminIds();
+  if (adminIds.length === 0) return;
+
+  const text = formatDailyCostSummary(usageStore.getAll(), usageStore.getBalance());
+  for (const adminId of adminIds) {
+    try {
+      await bot.telegram.sendMessage(adminId, text);
     } catch {
       // ignore
     }

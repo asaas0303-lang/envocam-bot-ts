@@ -12,6 +12,7 @@ import {
   refundEventsStore,
   activityStore,
   settingsStore,
+  usageStore,
   type CameraModel,
 } from "../data/store.js";
 import { isAdmin, downloadFileAsBase64, sleep } from "../helpers.js";
@@ -27,6 +28,7 @@ import {
   formatReturningCustomerRate,
   formatRefundStats,
   formatNewVsReturningPerWeek,
+  formatCostReport,
 } from "../stats.js";
 
 type AdminState =
@@ -37,7 +39,8 @@ type AdminState =
   | { step: "broadcast_confirm"; text: string }
   | { step: "awaiting_sample_title" }
   | { step: "awaiting_sample_text"; title: string }
-  | { step: "awaiting_sticker_sample" };
+  | { step: "awaiting_sticker_sample" }
+  | { step: "awaiting_api_balance" };
 
 const adminState = new Map<number, AdminState>();
 function getState(uid: number): AdminState { return adminState.get(uid) || { step: "idle" }; }
@@ -221,6 +224,14 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
   bot.command("stats", async (ctx) => {
     if (!ctx.from || !isAdmin(ctx.from.id)) return;
     await ctx.reply("Statistika bo'limi:", buildStatsMenu());
+  });
+
+  bot.command("xarajat", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    const text = formatCostReport(usageStore.getAll(), usageStore.getBalance());
+    await ctx.reply(text, Markup.inlineKeyboard([
+      [Markup.button.callback("API balans", "admin_api_balance")],
+    ]));
   });
 
   // ── Statistika ──
@@ -450,6 +461,22 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     await ctx.answerCbQuery();
     settingsStore.clearStickerSample();
     await showStickerSampleMenu(ctx, false);
+  });
+
+  // ── API balans (Anthropic kredit balansini o'zi hisoblab boradi) ──
+  bot.action("admin_api_balance", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await showApiBalanceMenu(ctx, false);
+  });
+
+  bot.action("admin_api_balance_set", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    setState(ctx.from.id, { step: "awaiting_api_balance" });
+    await ctx.editMessageText(
+      "Hozirgi Anthropic balansini USD da kiriting (masalan: 5 yoki 5.50):\n(Bekor — /panel)"
+    );
   });
 
   bot.action("admin_back_main", async (ctx) => {
@@ -698,6 +725,22 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
       return;
     }
 
+    // API balans kiritish
+    if (state.step === "awaiting_api_balance" && "text" in msg) {
+      const raw = msg.text.trim().replace(",", ".");
+      if (!raw || raw.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
+      const amount = Number(raw);
+      if (!Number.isFinite(amount) || amount < 0) {
+        await ctx.reply("Noto'g'ri summa. Faqat musbat son kiriting (masalan: 5 yoki 5.50):");
+        return;
+      }
+      usageStore.setBalance(amount);
+      clearState(ctx.from.id);
+      await ctx.reply(`Balans saqlandi: $${amount.toFixed(2)}`);
+      await showApiBalanceMenu(ctx, true);
+      return;
+    }
+
     // Kontent qo'shish
     if (state.step === "adding_content") {
       const { modelName, category } = state;
@@ -907,7 +950,8 @@ async function showMainMenu(ctx: BotContext): Promise<void> {
      Markup.button.callback("Hammaga xabar", "admin_broadcast")],
     [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples"),
      Markup.button.callback("Namuna rasm (stiker)", "admin_sticker_sample")],
-    [Markup.button.callback("Statistika", "admin_stats")],
+    [Markup.button.callback("Statistika", "admin_stats"),
+     Markup.button.callback("API balans", "admin_api_balance")],
   ]));
 }
 
@@ -920,7 +964,8 @@ async function showMainMenuEdit(ctx: BotContext): Promise<void> {
      Markup.button.callback("Hammaga xabar", "admin_broadcast")],
     [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples"),
      Markup.button.callback("Namuna rasm (stiker)", "admin_sticker_sample")],
-    [Markup.button.callback("Statistika", "admin_stats")],
+    [Markup.button.callback("Statistika", "admin_stats"),
+     Markup.button.callback("API balans", "admin_api_balance")],
   ]));
 }
 
@@ -985,6 +1030,23 @@ async function showStickerSampleMenu(ctx: BotContext, asNew: boolean): Promise<v
   ];
   if (sample) buttons.push([Markup.button.callback("O'chirish", "admin_sticker_sample_delete")]);
   buttons.push([Markup.button.callback("⬅️ Orqaga", "admin_back_main")]);
+  const keyboard = Markup.inlineKeyboard(buttons);
+  if (asNew) {
+    await ctx.reply(text, keyboard);
+  } else {
+    await ctx.editMessageText(text, keyboard);
+  }
+}
+
+async function showApiBalanceMenu(ctx: BotContext, asNew: boolean): Promise<void> {
+  const balance = usageStore.getBalance();
+  const text = balance
+    ? `Joriy balans: ~$${balance.amountUsd.toFixed(2)}\nOxirgi kiritilgan: ${new Date(balance.setAt).toLocaleString("uz-UZ", { timeZone: "Asia/Tashkent" })}\n\nAnthropic'da qolgan haqiqiy kredit balansini API orqali o'qib bo'lmaydi — bot har bir so'rov narxini o'zi hisoblab shu summadan ayirib boradi (taxminiy). Balansni to'ldirgandan keyin yangi summani shu yerdan qayta kiriting.`
+    : `Balans hali kiritilmagan.\n\nAnthropic'da qolgan haqiqiy kredit balansini API orqali o'qib bo'lmaydi — shuning uchun bot buni o'zi hisoblab boradi. Boshlang'ich balansni (masalan, Anthropic Console'dagi summani) shu yerdan kiriting.`;
+  const buttons = [
+    [Markup.button.callback(balance ? "Balansni qayta kiritish" : "Balansni kiritish", "admin_api_balance_set")],
+    [Markup.button.callback("⬅️ Orqaga", "admin_back_main")],
+  ];
   const keyboard = Markup.inlineKeyboard(buttons);
   if (asNew) {
     await ctx.reply(text, keyboard);

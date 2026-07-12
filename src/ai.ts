@@ -1,11 +1,118 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { REGIONS, type CameraModel, type ClientFeedback, type MessageRecord, type Region } from "./data/store.js";
+import {
+  REGIONS,
+  usageStore,
+  type AiFunctionName,
+  type CameraModel,
+  type ClientFeedback,
+  type MessageRecord,
+  type Region,
+} from "./data/store.js";
+import { notifyAdmins } from "./helpers.js";
+import { logger } from "./lib/logger.js";
 
 const anthropic = new Anthropic({
   apiKey: process.env["ANTHROPIC_API_KEY"],
 });
 
 const MODEL = "claude-sonnet-5";
+
+// ─── Narx konfiguratsiyasi va xarajat kuzatuvi ─────────────────────────────────
+//
+// Manba: https://platform.claude.com/docs/en/about-claude/pricing (tekshirilgan: 2026-07-12)
+// Claude Sonnet 5 — "introductory" narx, 2026-08-31 gacha amal qiladi:
+//   Input:  $2  / 1M token
+//   Output: $10 / 1M token
+//   Keshdan o'qish (cache hit): $0.20 / 1M token (bazaviy input narxining 0.1x)
+// 2026-09-01 dan boshlab standart narx: input $3, output $15 / 1M token —
+// shu sanadan keyin quyidagi qiymatlarni yangilash kerak.
+const MODEL_PRICING = {
+  inputPerMTok: 2,
+  outputPerMTok: 10,
+  cacheReadPerMTok: 0.2,
+};
+
+function tashkentDateStr(): string {
+  return new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function checkBalanceThresholds(): void {
+  const balance = usageStore.getBalance();
+  if (!balance) return;
+
+  if (balance.amountUsd < 0.2) {
+    if (!balance.criticalAlertSent) {
+      usageStore.markCriticalAlertSent();
+      usageStore.markLowAlertSent();
+      notifyAdmins(
+        `JIDDIY OGOHLANTIRISH — EnvoCam bot API balansi $${balance.amountUsd.toFixed(2)} ga tushdi!\n\nBot TEZ ORADA javob bera olmay qolishi mumkin. Anthropic Console'da balansni to'ldiring, so'ng admin panel → "API balans" bo'limidan yangi summani kiriting.`
+      ).catch(() => {});
+    }
+  } else if (balance.amountUsd < 1) {
+    if (!balance.lowAlertSent) {
+      usageStore.markLowAlertSent();
+      notifyAdmins(
+        `Ogohlantirish — EnvoCam bot API balansi $${balance.amountUsd.toFixed(2)} ga tushdi.\n\nBalansni to'ldirishni unutmang.`
+      ).catch(() => {});
+    }
+  }
+}
+
+function recordUsage(fn: AiFunctionName, usage: Anthropic.Usage): void {
+  // O'rnatilgan SDK (0.30.1) tipi hali "cache_read_input_tokens" maydonini
+  // e'lon qilmaydi, lekin API javobida haqiqatda mavjud — shuning uchun
+  // xavfsiz cast bilan o'qiymiz.
+  const inputTokens = usage.input_tokens ?? 0;
+  const outputTokens = usage.output_tokens ?? 0;
+  const cacheReadTokens = (usage as { cache_read_input_tokens?: number }).cache_read_input_tokens ?? 0;
+  const costUsd =
+    (inputTokens / 1_000_000) * MODEL_PRICING.inputPerMTok +
+    (outputTokens / 1_000_000) * MODEL_PRICING.outputPerMTok +
+    (cacheReadTokens / 1_000_000) * MODEL_PRICING.cacheReadPerMTok;
+
+  usageStore.record({ date: tashkentDateStr(), fn, inputTokens, outputTokens, cacheReadTokens, costUsd });
+  checkBalanceThresholds();
+}
+
+// Anthropic balans tugaganda shu xabar bilan xato qaytaradi — bu holatda
+// mijozga (mavjud fallback orqali) xushmuomala javob ketadi, lekin adminga
+// DARHOL xabar berish kerak, kunlik hisobotni kutmasdan. Spam bo'lmasligi
+// uchun bir xil xato uchun 30 daqiqada bir martadan ko'p yubormaymiz.
+let lastLowCreditNotifyAt = 0;
+const LOW_CREDIT_NOTIFY_THROTTLE_MS = 30 * 60 * 1000;
+
+function isLowCreditError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /credit balance is too low/i.test(message);
+}
+
+async function notifyLowCreditIfNeeded(err: unknown): Promise<void> {
+  if (!isLowCreditError(err)) return;
+  const now = Date.now();
+  if (now - lastLowCreditNotifyAt < LOW_CREDIT_NOTIFY_THROTTLE_MS) return;
+  lastLowCreditNotifyAt = now;
+  logger.error({ err }, "Anthropic API: kredit balansi tugadi");
+  await notifyAdmins(
+    "DIQQAT — Anthropic API kredit balansi TUGADI. Bot mijozlarga AI javob bera olmayapti!\n\nDarhol balansni to'ldiring: https://console.anthropic.com/settings/billing"
+  ).catch(() => {});
+}
+
+// Barcha Anthropic chaqiruvlari shu orqali o'tadi — har bir chaqiruvdan
+// keyin token/narx qayd etiladi, xato bo'lsa (masalan kredit tugagan bo'lsa)
+// adminga darhol xabar beriladi.
+async function callClaude(
+  fn: AiFunctionName,
+  params: Anthropic.MessageCreateParamsNonStreaming
+): Promise<Anthropic.Message> {
+  try {
+    const response = await anthropic.messages.create(params);
+    recordUsage(fn, response.usage);
+    return response;
+  } catch (err) {
+    await notifyLowCreditIfNeeded(err);
+    throw err;
+  }
+}
 
 // ─── Rasm tahlili ─────────────────────────────────────────────────────────────
 
@@ -38,7 +145,7 @@ export async function readBarcodeDigits(
     ? `Bu rasmda kamera qutisidagi oq stikerda vertikal yoki gorizontal yozilgan uzun barcode raqami bor (masalan 1000077693951, odatda 10 tadan ortiq xonali). Faqat shu raqamni yoz, boshqa hech narsa yozma — izoh, tushuntirish kerak emas. Aniq o'qiy olmasang yoki bunday raqam umuman ko'rinmasa, faqat "null" deb yoz.`
     : `Bu rasmda kamera qutisidagi barcode raqamining OXIRGI 4 ta raqami bo'lishi mumkin — ular odatda qolgan raqamlarga qaraganda KATTAROQ va QALINROQ shriftda, alohida ajratib yozilgan bo'ladi. Faqat shu 4 ta raqamni yoz, boshqa hech narsa yozma. Aniq topolmasang faqat "null" deb yoz.`;
 
-  const response = await anthropic.messages.create({
+  const response = await callClaude("readBarcodeDigits", {
     model: MODEL,
     max_tokens: 32,
     messages: [
@@ -114,7 +221,7 @@ Ro'yxatdagi hech bir modelga to'g'ri kelmasa "no_match" de.
 Faqat JSON qaytar: {"status": "matched|unclear|no_match", "model": "nom yoki null"}`,
   });
 
-  const response = await anthropic.messages.create({
+  const response = await callClaude("identifyModelFromImages", {
     model: MODEL,
     max_tokens: 256,
     messages: [{ role: "user", content }],
@@ -143,7 +250,7 @@ export interface ImageClassification {
 // chalkash javobga olib keladi. Shu funksiya bilan avval rasm turini
 // bilib olamiz.
 export async function classifyImage(image: ImageInput): Promise<ImageClassification> {
-  const response = await anthropic.messages.create({
+  const response = await callClaude("classifyImage", {
     model: MODEL,
     max_tokens: 128,
     messages: [
@@ -193,7 +300,7 @@ export interface IntentResult {
 }
 
 export async function detectIntent(text: string): Promise<IntentResult> {
-  const response = await anthropic.messages.create({
+  const response = await callClaude("detectIntent", {
     model: MODEL,
     max_tokens: 128,
     messages: [
@@ -257,7 +364,7 @@ export async function classifyProductFeedback(
   feedbackText: string,
   existingLabels: string[]
 ): Promise<string | null> {
-  const response = await anthropic.messages.create({
+  const response = await callClaude("classifyProductFeedback", {
     model: MODEL,
     max_tokens: 64,
     messages: [
@@ -291,7 +398,7 @@ Faqat JSON qaytar: {"label": "kategoriya nomi"}`,
 // ─── Viloyatni ro'yxatdagi nomga moslashtirish ──────────────────────────────
 
 export async function classifyRegion(text: string): Promise<Region | null> {
-  const response = await anthropic.messages.create({
+  const response = await callClaude("classifyRegion", {
     model: MODEL,
     max_tokens: 64,
     messages: [
@@ -327,7 +434,7 @@ export async function extractTextFromImage(
   imageBase64: string,
   mimeType: string
 ): Promise<string> {
-  const response = await anthropic.messages.create({
+  const response = await callClaude("extractTextFromImage", {
     model: MODEL,
     max_tokens: 2048,
     messages: [
@@ -491,7 +598,7 @@ ${samples.length > 0
     content: m.content,
   }));
 
-  const response = await anthropic.messages.create({
+  const response = await callClaude("answerQuestion", {
     model: MODEL,
     max_tokens: 1024,
     system: finalSystemPrompt,
@@ -531,7 +638,7 @@ export async function analyzeInsights(
     )
     .join("\n");
 
-  const response = await anthropic.messages.create({
+  const response = await callClaude("analyzeInsights", {
     model: MODEL,
     max_tokens: 2048,
     messages: [
@@ -593,7 +700,7 @@ export async function analyzeFeedback(
   const now = new Date(Date.now() + 5 * 60 * 60 * 1000);
   const dateStr = now.toISOString().slice(0, 10);
 
-  const response = await anthropic.messages.create({
+  const response = await callClaude("analyzeFeedback", {
     model: MODEL,
     max_tokens: 2048,
     messages: [
