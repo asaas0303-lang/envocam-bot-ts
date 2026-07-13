@@ -147,9 +147,13 @@ async function processIncomingMessage(
     // yozgan boshqa mijozlarning xabarlari umuman olinmay qoladi. runSerialized
     // shu mijoz uchun xabarlar ketma-ket (parallel emas) ishlanishini
     // kafolatlaydi.
-    // FAQAT raqamlardan iborat (uzun) matn — mijoz barcode raqamini qo'lda
-    // yozgan. Har qanday holatda (so'rovnoma vaqtida ham) barcode sifatida
-    // qabul qilamiz.
+    // USTUVORLIK TARTIBI (muhim): mijozning JORIY ehtiyoji har doim
+    // so'rovnomadan ustun. Shuning uchun barcode → ulanish usuli → model nomi
+    // holatlari avval tekshiriladi, so'rovnoma (feedbackStage) esa ENG OXIRIDA
+    // — faqat boshqa hech narsa kutilmayotgan bo'lsa.
+
+    // 1) FAQAT raqamlardan iborat (uzun) matn — mijoz barcode raqamini qo'lda
+    // yozgan. Har qanday holatda (so'rovnoma vaqtida ham) barcode sifatida qabul.
     if (isLikelyBarcodeText(text, client.feedbackStage)) {
       runSerialized(chatId, () =>
         handleTypedBarcode(ctx, client, text, businessConnectionId).catch(async (err) => {
@@ -159,17 +163,7 @@ async function processIncomingMessage(
       );
       return;
     }
-    // So'rovnoma davom etyaptimi? Xabar so'rovnoma javobimi yoki mijoz boshqa
-    // narsa (savol/yordam/salom) so'rayaptimi — shuni tekshirib yo'naltiramiz.
-    if (client.feedbackStage && client.feedbackStage !== "done") {
-      runSerialized(chatId, () =>
-        routeDuringFeedback(ctx, client, text, businessConnectionId).catch(async (err) => {
-          logger.error({ err, chatId }, "routeDuringFeedback failed");
-          await sendFallbackError(ctx, client, businessConnectionId);
-        })
-      );
-      return;
-    }
+    // 2) Ulanish usuli (qisqa/uzoq) kutilyaptimi — so'rovnomadan YUQORI.
     if (client.awaitingConnectionMethod) {
       runSerialized(chatId, () =>
         handleConnectionMethodAnswer(ctx, client, text, businessConnectionId).catch(async (err) => {
@@ -179,6 +173,7 @@ async function processIncomingMessage(
       );
       return;
     }
+    // 3) Model nomi kutilyaptimi.
     if (client.awaitingModelName) {
       runSerialized(chatId, () =>
         handleModelNameAnswer(ctx, client, text, businessConnectionId).catch(async (err) => {
@@ -188,6 +183,18 @@ async function processIncomingMessage(
       );
       return;
     }
+    // 4) So'rovnoma davom etyaptimi? routeDuringFeedback yana bir bor tekshiradi:
+    // xabar so'rovnoma javobimi yoki mijoz boshqa narsa (savol/yordam) so'rayaptimi.
+    if (client.feedbackStage && client.feedbackStage !== "done") {
+      runSerialized(chatId, () =>
+        routeDuringFeedback(ctx, client, text, businessConnectionId).catch(async (err) => {
+          logger.error({ err, chatId }, "routeDuringFeedback failed");
+          await sendFallbackError(ctx, client, businessConnectionId);
+        })
+      );
+      return;
+    }
+    // 5) Oddiy suhbat.
     runSerialized(chatId, () =>
       handleText(ctx, client, text, businessConnectionId).catch(async (err) => {
         logger.error({ err, chatId }, "handleText failed");
@@ -578,6 +585,7 @@ async function askConnectionMethodOrDeliver(
 ): Promise<void> {
   if (!client.connectionMethod) {
     client.awaitingConnectionMethod = true;
+    client.connectionMethodAsks = 1;
     clientsStore.save(client);
     await sendMsg(ctx, client.chatId, connectionMethodQuestion(client.language), businessConnectionId, { allowRepeat: true });
   } else {
@@ -594,7 +602,20 @@ async function handleConnectCameraRequest(
   const chatId = client.chatId;
 
   if (!client.connectionMethod) {
+    const asks = client.connectionMethodAsks ?? 0;
+    // Ikki martadan ko'p so'ramaymiz — aks holda mijoz aniq javob bermasa
+    // sikl bo'lardi. Chegaradan keyin savolni tashlab, umumiy yordam beramiz.
+    if (asks >= 2) {
+      client.awaitingConnectionMethod = false;
+      clientsStore.save(client);
+      const fallback = client.language !== "ru"
+        ? "Mayli, keling boshqacha yordam beraman — kamerangizda hozir aniq nima muammo bor yoki nima qilmoqchisiz, shuni yozing."
+        : "Хорошо, помогу иначе — напишите, что именно не так с камерой или что вы хотите сделать.";
+      await sendMsg(ctx, chatId, fallback, businessConnectionId);
+      return;
+    }
     client.awaitingConnectionMethod = true;
+    client.connectionMethodAsks = asks + 1;
     clientsStore.save(client);
     await sendMsg(ctx, chatId, connectionMethodQuestion(client.language), businessConnectionId, { allowRepeat: true });
     return;
@@ -612,34 +633,67 @@ async function handleConnectCameraRequest(
   await deliverConnectionGuide(ctx, client, businessConnectionId);
 }
 
-// "awaitingConnectionMethod" holatida kelgan javobni (qisqa/uzoq) tekshiradi
+// "awaitingConnectionMethod" holatida kelgan javobni tekshiradi. MUHIM:
+// mijoz ko'pincha bu savolga javob bermay, o'z muammosini aytadi ("kamera
+// o'chib qolayapti", "tasvir xira" va h.k.) — bunday holda savolni QAYTA
+// SO'RAMASDAN, muammoga javob beramiz. Savol maksimum 2 marta so'raladi.
 async function handleConnectionMethodAnswer(
   ctx: BotContext,
   client: ClientData,
   text: string,
   businessConnectionId?: string
 ): Promise<void> {
-  const { connectionMethod } = await detectIntent(text);
+  const { connectionMethod, intent, productFeedback } = await detectIntent(text);
 
-  if (!connectionMethod) {
-    await sendMsg(ctx, client.chatId, connectionMethodQuestion(client.language), businessConnectionId, { allowRepeat: true });
-    return;
-  }
+  // Mijoz aniq qisqa/uzoq javob berdi → davom etamiz.
+  if (connectionMethod) {
+    client.connectionMethod = connectionMethod;
+    client.awaitingConnectionMethod = false;
+    client.connectionMethodAsks = 0;
+    clientsStore.save(client);
 
-  client.connectionMethod = connectionMethod;
-  client.awaitingConnectionMethod = false;
-  clientsStore.save(client);
-
-  if (!client.lastModelName) {
-    if (!client.askedForPhotoOnce) {
-      client.askedForPhotoOnce = true;
-      clientsStore.save(client);
-      await sendMsg(ctx, client.chatId, askForCameraPhotoText(client.language), businessConnectionId);
+    if (!client.lastModelName) {
+      if (!client.askedForPhotoOnce) {
+        client.askedForPhotoOnce = true;
+        clientsStore.save(client);
+        await sendMsg(ctx, client.chatId, askForCameraPhotoText(client.language), businessConnectionId);
+      }
+      return;
     }
+
+    await deliverConnectionGuide(ctx, client, businessConnectionId);
     return;
   }
 
-  await deliverConnectionGuide(ctx, client, businessConnectionId);
+  // Javob emas. Agar mijoz JIDDIY narsa aytayotgan bo'lsa (muammo, shikoyat,
+  // savol, yordam so'rovi — ya'ni salomdan boshqa har qanday narsa yoki
+  // mahsulot haqida fikr) — ulanish savolini TASHLAB, muammoga javob beramiz.
+  const isSubstantive = intent !== "greeting" || !!productFeedback;
+  if (isSubstantive) {
+    client.awaitingConnectionMethod = false;
+    // Muammo/savol bo'lsa hisoblagichni nolga qaytaramiz; lekin mijoz yana
+    // "ulashga yordam ber" desa (connect_camera) — hisoblagichni saqlaymiz,
+    // aks holda savol qayta-qayta so'ralib sikl bo'lishi mumkin.
+    if (intent !== "connect_camera") client.connectionMethodAsks = 0;
+    clientsStore.save(client);
+    await handleText(ctx, client, text, businessConnectionId);
+    return;
+  }
+
+  // Salom yoki noaniq qisqa narsa — ulanish savolini yana bir marta so'raymiz,
+  // lekin JAMI 2 martadan oshirmaymiz. Chegaradan keyin savolni butunlay
+  // tashlab, oddiy yordamga o'tamiz — mijoz cheksiz siklda qolmaydi.
+  const asks = (client.connectionMethodAsks ?? 1) + 1;
+  if (asks > 2) {
+    client.awaitingConnectionMethod = false;
+    client.connectionMethodAsks = 0;
+    clientsStore.save(client);
+    await handleText(ctx, client, text, businessConnectionId);
+    return;
+  }
+  client.connectionMethodAsks = asks;
+  clientsStore.save(client);
+  await sendMsg(ctx, client.chatId, connectionMethodQuestion(client.language), businessConnectionId, { allowRepeat: true });
 }
 
 // ─── Barcode orqali model aniqlash ─────────────────────────────────────────────
@@ -727,7 +781,11 @@ function findModelByDigits(
 
   if (isPartial) {
     if (d.length !== 4) return undefined;
-    return models.find((m) => m.barcodes.some((b) => onlyDigits(b).slice(-4) === d));
+    // Oxirgi 4 raqam bo'yicha qidiruv — agar BIR NECHTA model mos kelsa,
+    // bittasini tanlash noto'g'ri bo'lishi mumkin. Bunday holda "unclear"
+    // (undefined) qaytaramiz — chaqiruvchi aniqroq rasm so'raydi.
+    const matches = models.filter((m) => m.barcodes.some((b) => onlyDigits(b).slice(-4) === d));
+    return matches.length === 1 ? matches[0] : undefined;
   }
 
   return models.find((m) =>

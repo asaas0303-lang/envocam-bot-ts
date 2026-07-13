@@ -115,6 +115,13 @@ async function checkFeedbackCollection(bot: Telegraf<BotContext>): Promise<void>
     // Mijoz bilan hali jiddiy muloqot bo'lmagan (masalan faqat bitta stiker yuborgan)
     if (!client.hasGreeted) continue;
 
+    // MUHIM — so'rovnomani faqat mijoz bilan HAMMASI JOYIDA bo'lganda boshlaymiz.
+    // Mijozning ochiq (hal bo'lmagan) muammosi bo'lsa, so'rovnoma bilan bezovta
+    // qilmaymiz. Ijobiy yakun belgisi: mijoz "rahmat/bo'ldi/ishladi" degan
+    // (gratitudeSent) yoki ulanish tasdiqlangan (connectionConfirmed).
+    if (client.refundRequested) continue;            // norozi mijoz — so'ramaymiz
+    if (!client.gratitudeSent && !client.connectionConfirmed) continue;
+
     // Video yuborilgan bo'lsa o'shandan, aks holda (uzoq masofa mijozlari
     // uchun ham) oxirgi ko'rinishdan FEEDBACK_DELAY_MS o'tgan bo'lishi kerak.
     const baseTime = client.lastVideoSentAt

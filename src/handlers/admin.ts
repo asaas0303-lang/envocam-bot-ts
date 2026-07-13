@@ -81,6 +81,10 @@ function short(text: string | undefined, max = 28): string {
   return text.length > max ? text.slice(0, max) + "…" : text;
 }
 
+function onlyDigits(s: string): string {
+  return s.replace(/\D/g, "");
+}
+
 // ─── Kategoriya ro'yxat menyu ─────────────────────────────────────────────────
 
 function buildCategoryKeyboard(modelName: string, category: string) {
@@ -225,12 +229,33 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
       await ctx.reply("Hech qanday model yo'q.");
       return;
     }
+
+    // Bir xil raqam bir necha modelda uchrasa — TO'QNASHUV. Har bir normalizatsiya
+    // qilingan raqam qaysi modellarda borligini yig'amiz.
+    const byCode = new Map<string, string[]>();
+    for (const m of models) {
+      for (const b of m.barcodes) {
+        const d = onlyDigits(b);
+        if (!d) continue;
+        if (!byCode.has(d)) byCode.set(d, []);
+        if (!byCode.get(d)!.includes(m.name)) byCode.get(d)!.push(m.name);
+      }
+    }
+    const collisions = [...byCode.entries()].filter(([, names]) => names.length > 1);
+
     const lines = models.map((m) => {
       const codes = m.barcodes.length > 0 ? m.barcodes.join(", ") : "(barcode yo'q)";
       return `${m.name} (${m.barcodes.length} ta):\n${codes}`;
     });
-    const header = `Bazadagi barcode raqamlari (jami ${models.length} ta model):\n\n`;
-    await sendChunkedReply(ctx, header + lines.join("\n\n"));
+
+    let text = `Bazadagi barcode raqamlari (jami ${models.length} ta model):\n\n` + lines.join("\n\n");
+    if (collisions.length > 0) {
+      text += "\n\n⚠️ TO'QNASHUV (bir xil raqam bir necha modelda):";
+      for (const [code, names] of collisions) {
+        text += `\n${code} → ${names.join(", ")}`;
+      }
+    }
+    await sendChunkedReply(ctx, text);
   });
 
   bot.command("hisobot", async (ctx) => {
@@ -786,8 +811,8 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
         const raw = msg.text.trim();
         const codes = raw
           .split(/[\s,;]+/)
-          .map((c) => c.trim())
-          .filter((c) => c.length >= 6 && /^\d+$/.test(c));
+          .map((c) => onlyDigits(c))
+          .filter((c) => c.length >= 6);
         if (codes.length === 0) {
           await ctx.reply("Barcode raqami topilmadi. Faqat raqamlardan iborat kod(lar)ni yuboring (kamida 6 xonali).");
           return;
@@ -797,25 +822,31 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
         let added = 0;
         const errors: string[] = [];
         const warnings: string[] = [];
+        const alreadyHere: string[] = [];
 
         for (const code of codes) {
-          // Bu barcode boshqa modelda allaqachon ro'yxatdami?
-          const conflictModel = allModels.find((m) => m.name !== model.name && m.barcodes.includes(code));
+          // Bu barcode boshqa modelda allaqachon ro'yxatdami? Bo'lsa — QO'SHMAYMIZ.
+          const conflictModel = allModels.find(
+            (m) => m.name !== model.name && m.barcodes.some((b) => onlyDigits(b) === code)
+          );
           if (conflictModel) {
-            errors.push(`${code} — "${conflictModel.name}" modelida allaqachon bor, o'tkazib yuborildi.`);
+            errors.push(`${code} — bu barcode allaqachon "${conflictModel.name}" modelida bor. Avval u yerdan o'chiring, keyin bu yerga qo'shing.`);
             continue;
           }
-          if (model.barcodes.includes(code)) continue; // allaqachon shu modelda bor
+          if (model.barcodes.some((b) => onlyDigits(b) === code)) {
+            alreadyHere.push(code); // allaqachon shu modelda bor
+            continue;
+          }
 
           // Oxirgi 4 raqami boshqa modelning biror barcode'i bilan bir xilmi?
-          // (bu OCR "oxirgi 4 raqam" fallback'ida ikkalasini chalkashtirib
-          // qo'yishi mumkin — lekin qo'shishga baribir ruxsat beramiz.)
+          // (OCR "oxirgi 4 raqam" fallback'ida chalkashishi mumkin — qo'shamiz,
+          // lekin ogohlantiramiz.)
           const last4 = code.slice(-4);
           const collisionModel = allModels.find(
-            (m) => m.name !== model.name && m.barcodes.some((b) => b.slice(-4) === last4)
+            (m) => m.name !== model.name && m.barcodes.some((b) => onlyDigits(b).slice(-4) === last4)
           );
           if (collisionModel) {
-            warnings.push(`${code} — oxirgi 4 raqami ("${last4}") "${collisionModel.name}" modelining barcode'i bilan bir xil. Ikkala model orasida chalkashlik bo'lishi mumkin, lekin baribir qo'shildi.`);
+            warnings.push(`${code} — oxirgi 4 raqami ("${last4}") "${collisionModel.name}" modelinikiga to'g'ri keladi. Baribir qo'shildi, lekin chalkashlik bo'lishi mumkin.`);
           }
 
           model.barcodes.push(code);
@@ -823,9 +854,18 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
         }
         modelsStore.save(model);
 
-        const lines = [`Saqlandi. Qo'shildi: ${added} ta. Jami: ${model.barcodes.length} ta barcode.`];
+        // Xabar aniq bo'lsin: qaysi model, nima qo'shildi, nima qo'shilmadi.
+        const lines: string[] = [];
+        if (added > 0) {
+          lines.push(`✅ "${model.name}" modeliga ${added} ta barcode qo'shildi. Jami: ${model.barcodes.length} ta.`);
+        } else {
+          lines.push(`Hech qanday yangi barcode qo'shilmadi. "${model.name}" modelida jami: ${model.barcodes.length} ta.`);
+        }
+        if (alreadyHere.length > 0) {
+          lines.push("", `Allaqachon shu modelda bor edi: ${alreadyHere.join(", ")}`);
+        }
         if (warnings.length > 0) lines.push("", "⚠️ Ogohlantirishlar:", ...warnings);
-        if (errors.length > 0) lines.push("", "❌ Qo'shilmadi:", ...errors);
+        if (errors.length > 0) lines.push("", "❌ Qo'shilmadi (to'qnashuv):", ...errors);
         await ctx.reply(lines.join("\n"));
         return;
       }

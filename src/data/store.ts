@@ -140,6 +140,7 @@ export interface ClientData {
   lastModelName?: string;
   connectionMethod?: "short" | "long";
   awaitingConnectionMethod?: boolean;
+  connectionMethodAsks?: number; // ulanish usuli savoli necha marta so'ralgan (max 2, keyin tashlanadi)
   barcodeAttempts?: number;      // nechta marta "yaqinroq rasm" so'ralgan
   awaitingModelName?: boolean;   // barcode aniqlanmagach, oxirgi chora — model nomini matn bilan so'rash
   refundRequested?: boolean;
