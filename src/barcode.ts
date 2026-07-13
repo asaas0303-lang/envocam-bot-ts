@@ -19,9 +19,28 @@ const jsQR = require("jsqr") as JsQRFn;
 
 export type BarcodeMethod = "qr" | "ocr_full" | "ocr_last4";
 
-export interface BarcodeReadResult {
-  barcode: string | null;
-  method: BarcodeMethod | null;
+// Bir usul bazadagi modelga mos kelganda qaytadi.
+export interface BarcodeMatch {
+  method: BarcodeMethod;
+  value: string;       // moslashtirilgan raqam (faqat raqamlar; last4 uchun 4 xonali)
+  isPartial: boolean;  // last4 (oxirgi 4 raqam) bo'lsa true
+}
+
+export interface BarcodeReadOutcome {
+  match: BarcodeMatch | null;                          // birinchi mos kelgan usul (bo'lmasa null)
+  bestRead: { value: string; method: BarcodeMethod } | null; // mos kelmasa ham, o'qilgan eng yaxshi TO'LIQ raqam (admin xabari uchun)
+  qrRaw: string | null;                                // QR ning xom mazmuni (URL ham bo'lishi mumkin) — loglash/diagnostika uchun
+}
+
+// Bazadagi modellarga mos-mosligini tekshiruvchi callback — moslik topilgan
+// zahoti qimmat AI-OCR chaqiruvlarini to'xtatish uchun ishlatiladi.
+export type BarcodeMatcher = (digits: string, isPartial: boolean) => boolean;
+
+// Matn ichidan (masalan QR dagi URL dan) uzun raqam ketma-ketliklarini
+// ajratib oladi — eng uzuni birinchi bo'lib qaytadi (barcode odatda eng uzun).
+function extractDigitRuns(text: string, minLen: number): string[] {
+  const runs = text.match(/\d+/g) ?? [];
+  return [...new Set(runs.filter((r) => r.length >= minLen))].sort((a, b) => b.length - a.length);
 }
 
 // ─── QR kod dekodlash (AI chaqirmaydi, eng arzon va eng ishonchli usul) ───────
@@ -96,32 +115,61 @@ async function enhanceForOcr(base64: string): Promise<ImageInput> {
 
 // Mijoz rasmidan barcode raqamini avtomatik o'qishga harakat qiladi — mijozdan
 // HECH QACHON raqamni qo'lda yozib yuborish so'ralmaydi. Har bir bosqich
-// Railway loglariga yoziladi, shunda keyinchalik qaysi usul qanchalik
-// ishlayotganini ko'rish mumkin.
+// Railway loglariga XOM holda yoziladi. QR dan raqam ajratib olinadi (QR ichida
+// URL/serial bo'lishi mumkin), va agar QR raqami bazaga mos kelmasa — to'xtamay,
+// bosma raqamni AI-OCR bilan o'qishga o'tadi (chunki QR ba'zan boshqa narsani,
+// bosma raqam esa aynan admin kiritgan raqamni bildiradi).
 export async function readBarcodeFromImage(
   image: ImageInput,
-  chatId: string
-): Promise<BarcodeReadResult> {
-  const qr = await tryDecodeQR(image.base64);
-  logger.info({ chatId, qr: qr ?? null }, "barcode: QR dekod urinildi");
-  if (qr) return { barcode: qr, method: "qr" };
+  chatId: string,
+  isKnown: BarcodeMatcher
+): Promise<BarcodeReadOutcome> {
+  let bestFull: { value: string; method: BarcodeMethod } | null = null;
 
+  // ─ QADAM 1: QR ─
+  const qrRaw = await tryDecodeQR(image.base64);
+  logger.info({ chatId, qrRaw: qrRaw ?? null }, "barcode: QR dekod xom natijasi");
+  const qrRuns = qrRaw ? extractDigitRuns(qrRaw, 8) : [];
+  logger.info({ chatId, qrRuns }, "barcode: QR ichidan ajratilgan raqamlar");
+  for (const digits of qrRuns) {
+    if (!bestFull) bestFull = { value: digits, method: "qr" };
+    if (isKnown(digits, false)) {
+      logger.info({ chatId, digits }, "barcode: QR raqami bazadagi modelga MOS keldi");
+      return { match: { method: "qr", value: digits, isPartial: false }, bestRead: bestFull, qrRaw };
+    }
+  }
+
+  // ─ OCR uchun rasmni tayyorlash ─
   let enhanced: ImageInput;
   try {
     enhanced = await enhanceForOcr(image.base64);
   } catch (err) {
     logger.error({ err, chatId }, "barcode: OCR uchun rasm tayyorlashda xatolik");
-    return { barcode: null, method: null };
+    return { match: null, bestRead: bestFull, qrRaw };
   }
 
+  // ─ QADAM 2: OCR (to'liq raqam) ─
   const full = await readBarcodeDigits(enhanced, "full");
-  logger.info({ chatId, full: full ?? null }, "barcode: OCR (to'liq raqam) urinildi");
-  if (full) return { barcode: full, method: "ocr_full" };
+  logger.info({ chatId, full: full ?? null }, "barcode: OCR (to'liq raqam) natijasi");
+  if (full) {
+    if (!bestFull || bestFull.method === "qr") bestFull = { value: full, method: "ocr_full" };
+    if (isKnown(full, false)) {
+      logger.info({ chatId, full }, "barcode: OCR to'liq raqami bazadagi modelga MOS keldi");
+      return { match: { method: "ocr_full", value: full, isPartial: false }, bestRead: bestFull, qrRaw };
+    }
+  }
 
+  // ─ QADAM 3: OCR (oxirgi 4 raqam) ─
   const last4 = await readBarcodeDigits(enhanced, "last4");
-  logger.info({ chatId, last4: last4 ?? null }, "barcode: OCR (oxirgi 4 raqam) urinildi");
-  if (last4) return { barcode: last4, method: "ocr_last4" };
+  logger.info({ chatId, last4: last4 ?? null }, "barcode: OCR (oxirgi 4 raqam) natijasi");
+  if (last4 && isKnown(last4, true)) {
+    logger.info({ chatId, last4 }, "barcode: OCR oxirgi-4 raqami bazadagi modelga MOS keldi");
+    return { match: { method: "ocr_last4", value: last4, isPartial: true }, bestRead: bestFull, qrRaw };
+  }
 
-  logger.info({ chatId }, "barcode: hech qanday usul bilan topilmadi");
-  return { barcode: null, method: null };
+  logger.info(
+    { chatId, bestRead: bestFull?.value ?? null },
+    "barcode: hech qaysi usul bilan MOS model topilmadi"
+  );
+  return { match: null, bestRead: bestFull, qrRaw };
 }

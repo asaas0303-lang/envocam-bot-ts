@@ -158,9 +158,53 @@ export async function readBarcodeDigits(
 
   const block = response.content[0];
   if (block.type !== "text") return null;
+  // Xom natijani (AI aynan nima yozganini) loglaymiz — Railway logida
+  // qanday o'qilayotganini aniq ko'rish uchun.
+  logger.info({ mode, rawOcr: block.text }, "barcode: AI-OCR xom natijasi");
   const digits = block.text.replace(/\D/g, "");
   if (mode === "full") return digits.length >= 8 ? digits : null;
   return digits.length === 4 ? digits : null;
+}
+
+// ─── So'rovnoma javobini tasniflash ───────────────────────────────────────────
+
+// Mijoz so'rovnoma savoliga JAVOB bermoqdami, yoki umuman boshqa narsa
+// (savol, yordam so'rovi, salomlashish, muammo) demoqdami — shuni aniqlaydi,
+// shunda so'rovnoma mijozning haqiqiy so'rovini "yutib" yubormaydi.
+export async function classifySurveyReply(
+  question: string,
+  reply: string
+): Promise<"survey_answer" | "other"> {
+  try {
+    const response = await callClaude("classifySurveyReply", {
+      model: MODEL,
+      max_tokens: 32,
+      messages: [
+        {
+          role: "user",
+          content: `Bot mijozga so'rovnoma savolini berdi: "${question}"
+Mijoz javobi: "${reply}"
+
+Bu javob AYNAN shu so'rovnoma savoliga javobmi, yoki mijoz butunlay boshqa narsa (salomlashish, yordam so'rovi, kamerani ulash/sozlash muammosi, boshqa savol, pul qaytarish) demoqdami?
+
+- Agar mijoz shu savolga javob berayotgan bo'lsa (hatto qisqa, noaniq yoki shikoyat shaklida bo'lsa ham) — "survey_answer".
+- Agar mijoz javob bermay, bir narsa SO'RAYOTGAN, yordam kutayotgan yoki salomlashayotgan bo'lsa — "other".
+
+Faqat JSON qaytar: {"kind":"survey_answer|other"}`,
+        },
+      ],
+    });
+
+    const block = response.content[0];
+    if (block.type !== "text") return "survey_answer";
+    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return "survey_answer";
+    const parsed = JSON.parse(jsonMatch[0]) as { kind?: string };
+    return parsed.kind === "other" ? "other" : "survey_answer";
+  } catch {
+    // Tasnif ishlamasa — hozirgi xatti-harakatni saqlaymiz (so'rovnoma davom etadi).
+    return "survey_answer";
+  }
 }
 
 // Mijoz rasm(lar)idan kamera modelini aniqlaydi. ENG ISHONCHLI belgi —

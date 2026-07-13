@@ -28,9 +28,10 @@ import {
   classifyProductFeedback,
   classifyRegion,
   classifyImage,
+  classifySurveyReply,
   type ImageClassification,
 } from "../ai.js";
-import { readBarcodeFromImage, type BarcodeMethod } from "../barcode.js";
+import { readBarcodeFromImage } from "../barcode.js";
 import type { ClientFeedback } from "../data/store.js";
 import { logger } from "../lib/logger.js";
 
@@ -146,10 +147,24 @@ async function processIncomingMessage(
     // yozgan boshqa mijozlarning xabarlari umuman olinmay qoladi. runSerialized
     // shu mijoz uchun xabarlar ketma-ket (parallel emas) ishlanishini
     // kafolatlaydi.
+    // FAQAT raqamlardan iborat (uzun) matn — mijoz barcode raqamini qo'lda
+    // yozgan. Har qanday holatda (so'rovnoma vaqtida ham) barcode sifatida
+    // qabul qilamiz.
+    if (isLikelyBarcodeText(text, client.feedbackStage)) {
+      runSerialized(chatId, () =>
+        handleTypedBarcode(ctx, client, text, businessConnectionId).catch(async (err) => {
+          logger.error({ err, chatId }, "handleTypedBarcode failed");
+          await sendFallbackError(ctx, client, businessConnectionId);
+        })
+      );
+      return;
+    }
+    // So'rovnoma davom etyaptimi? Xabar so'rovnoma javobimi yoki mijoz boshqa
+    // narsa (savol/yordam/salom) so'rayaptimi — shuni tekshirib yo'naltiramiz.
     if (client.feedbackStage && client.feedbackStage !== "done") {
       runSerialized(chatId, () =>
-        handleFeedback(ctx, client, text, businessConnectionId).catch(async (err) => {
-          logger.error({ err, chatId }, "handleFeedback failed");
+        routeDuringFeedback(ctx, client, text, businessConnectionId).catch(async (err) => {
+          logger.error({ err, chatId }, "routeDuringFeedback failed");
           await sendFallbackError(ctx, client, businessConnectionId);
         })
       );
@@ -302,22 +317,52 @@ async function flushPhotos(chatId: string): Promise<void> {
   if (!buf) return;
   photoBuffers.delete(chatId);
 
-  const client = clientsStore.getById(chatId);
-  if (!client) return;
-
-  try {
-    await handlePhotos(buf.ctx, client, buf.fileIds, buf.businessConnectionId, buf.caption);
-  } catch {
+  // Rasmni qayta ishlashni ham shu mijozning navbatiga qo'yamiz — aks holda
+  // mijoz debounce oynasidan tashqarida bir necha rasm yuborsa, bir nechta
+  // handlePhotos parallel ishlab, bir xil javobni takror yuborishi mumkin edi.
+  runSerialized(chatId, async () => {
+    const client = clientsStore.getById(chatId);
+    if (!client) return;
     try {
-      const errMsg =
-        client.language === "ru"
-          ? "Не удалось обработать фото, попробуйте ещё раз."
-          : "Rasmni qayta ishlab bo'lmadi, birozdan so'ng qayta yuboring.";
-      await sendMsg(buf.ctx, chatId, errMsg, buf.businessConnectionId);
-    } catch {
-      // ignore
+      await handlePhotos(buf.ctx, client, buf.fileIds, buf.businessConnectionId, buf.caption);
+    } catch (err) {
+      logger.error({ err, chatId }, "handlePhotos failed");
+      try {
+        const errMsg =
+          client.language === "ru"
+            ? "Не удалось обработать фото, попробуйте ещё раз."
+            : "Rasmni qayta ishlab bo'lmadi, birozdan so'ng qayta yuboring.";
+        await sendMsg(buf.ctx, chatId, errMsg, buf.businessConnectionId);
+      } catch {
+        // ignore
+      }
+    }
+  });
+}
+
+// ─── Dublikat yuborishdan himoya ─────────────────────────────────────────────
+// Bir nechta oqim (rasm buferi, matn oqimi, barcode oqimi) bir-birini bilmay
+// bir xil javobni mustaqil yuborib qo'yishi mumkin. Shu himoya: aynan bir xil
+// matn/rasm shu mijozga oxirgi 2 daqiqa ichida yuborilgan bo'lsa — qayta
+// yubormaydi. Ataylab takrorlanadigan navigatsion so'rovlar (masalan ulash
+// usuli savoli) allowRepeat=true bilan bu himoyani chetlab o'tadi.
+
+const DUP_WINDOW_MS = 2 * 60 * 1000;
+const recentSends = new Map<string, number>();
+
+function isDuplicateSend(chatId: string, key: string): boolean {
+  const now = Date.now();
+  // Vaqti o'tgan yozuvlarni tozalab turamiz (xotira cheksiz o'smasin).
+  if (recentSends.size > 500) {
+    for (const [k, t] of recentSends) {
+      if (now - t > DUP_WINDOW_MS) recentSends.delete(k);
     }
   }
+  const mapKey = `${chatId}|${key}`;
+  const last = recentSends.get(mapKey);
+  if (last !== undefined && now - last < DUP_WINDOW_MS) return true;
+  recentSends.set(mapKey, now);
+  return false;
 }
 
 // ─── Business yoki oddiy xabar yuborish ──────────────────────────────────────
@@ -326,8 +371,13 @@ async function sendMsg(
   ctx: BotContext,
   chatId: string,
   text: string,
-  businessConnectionId?: string
+  businessConnectionId?: string,
+  options?: { allowRepeat?: boolean }
 ): Promise<void> {
+  if (!options?.allowRepeat && isDuplicateSend(chatId, "t:" + text)) {
+    logger.warn({ chatId }, "sendMsg: dublikat matn bloklandi");
+    return;
+  }
   if (businessConnectionId) {
     await ctx.telegram.callApi("sendMessage", {
       chat_id: chatId,
@@ -399,8 +449,13 @@ async function sendPhotoMsg(
   chatId: string,
   fileId: string,
   caption: string | undefined,
-  businessConnectionId?: string
+  businessConnectionId?: string,
+  options?: { allowRepeat?: boolean }
 ): Promise<void> {
+  if (!options?.allowRepeat && isDuplicateSend(chatId, "p:" + fileId + "|" + (caption ?? ""))) {
+    logger.warn({ chatId }, "sendPhotoMsg: dublikat rasm bloklandi");
+    return;
+  }
   if (businessConnectionId) {
     const payload: Record<string, unknown> = {
       chat_id: chatId,
@@ -524,7 +579,7 @@ async function askConnectionMethodOrDeliver(
   if (!client.connectionMethod) {
     client.awaitingConnectionMethod = true;
     clientsStore.save(client);
-    await sendMsg(ctx, client.chatId, connectionMethodQuestion(client.language), businessConnectionId);
+    await sendMsg(ctx, client.chatId, connectionMethodQuestion(client.language), businessConnectionId, { allowRepeat: true });
   } else {
     await deliverConnectionGuide(ctx, client, businessConnectionId);
   }
@@ -541,7 +596,7 @@ async function handleConnectCameraRequest(
   if (!client.connectionMethod) {
     client.awaitingConnectionMethod = true;
     clientsStore.save(client);
-    await sendMsg(ctx, chatId, connectionMethodQuestion(client.language), businessConnectionId);
+    await sendMsg(ctx, chatId, connectionMethodQuestion(client.language), businessConnectionId, { allowRepeat: true });
     return;
   }
 
@@ -567,7 +622,7 @@ async function handleConnectionMethodAnswer(
   const { connectionMethod } = await detectIntent(text);
 
   if (!connectionMethod) {
-    await sendMsg(ctx, client.chatId, connectionMethodQuestion(client.language), businessConnectionId);
+    await sendMsg(ctx, client.chatId, connectionMethodQuestion(client.language), businessConnectionId, { allowRepeat: true });
     return;
   }
 
@@ -655,15 +710,38 @@ async function handleUnknownBarcode(
   }
 }
 
-function findModelByBarcode(
+function onlyDigits(s: string): string {
+  return s.replace(/\D/g, "");
+}
+
+// Barcode solishtirish — IKKALA tomon ham faqat raqamlarga keltirilib
+// solishtiriladi (bo'sh joy, defis, URL bo'laklari e'tiborsiz qoladi).
+// isPartial=true bo'lsa faqat oxirgi 4 raqam solishtiriladi (OCR last4 uchun).
+function findModelByDigits(
   models: CameraModel[],
-  barcode: string,
-  method: BarcodeMethod
+  value: string,
+  isPartial: boolean
 ): CameraModel | undefined {
-  if (method === "ocr_last4") {
-    return models.find((m) => m.barcodes.some((b) => b.slice(-4) === barcode));
+  const d = onlyDigits(value);
+  if (!d) return undefined;
+
+  if (isPartial) {
+    if (d.length !== 4) return undefined;
+    return models.find((m) => m.barcodes.some((b) => onlyDigits(b).slice(-4) === d));
   }
-  return models.find((m) => m.barcodes.includes(barcode));
+
+  return models.find((m) =>
+    m.barcodes.some((b) => {
+      const bd = onlyDigits(b);
+      if (!bd) return false;
+      if (bd === d) return true;
+      // Boshdagi nol / qo'shimcha prefiks farqiga bardosh: qisqasi kamida
+      // 10 xonali bo'lib, uzunining oxirini to'liq qamrasa — mos deb qabul qilamiz.
+      const shorter = bd.length <= d.length ? bd : d;
+      const longer = bd.length <= d.length ? d : bd;
+      return shorter.length >= 10 && longer.endsWith(shorter);
+    })
+  );
 }
 
 // QADAM 4 — barcode avtomatik o'qilmasa, admin yuklagan namuna rasm (stiker
@@ -676,9 +754,9 @@ async function sendCloserPhotoRequest(
   const text = askForCloserPhotoText(client.language);
   const sample = settingsStore.getStickerSample();
   if (sample) {
-    await sendPhotoMsg(ctx, client.chatId, sample.file_id, text, businessConnectionId);
+    await sendPhotoMsg(ctx, client.chatId, sample.file_id, text, businessConnectionId, { allowRepeat: true });
   } else {
-    await sendMsg(ctx, client.chatId, text, businessConnectionId);
+    await sendMsg(ctx, client.chatId, text, businessConnectionId, { allowRepeat: true });
   }
 }
 
@@ -769,6 +847,120 @@ function recordProductFeedback(feedbackText: string, client: ClientData): void {
     });
 }
 
+// ─── Mijoz qo'lda yozgan barcode raqami ───────────────────────────────────────
+
+// Matn faqat (uzun) raqamdan iboratmi — ya'ni mijoz barcode raqamini yozganmi.
+// ask_budget bosqichida qisqa raqam (narx) bo'lishi mumkin, shuning uchun u
+// yerda faqat aniq uzun (12+) raqamni barcode deb qabul qilamiz.
+function isLikelyBarcodeText(text: string, feedbackStage?: ClientData["feedbackStage"]): boolean {
+  const d = text.replace(/[\s-]/g, "");
+  if (!/^\d{8,}$/.test(d)) return false;
+  if (feedbackStage === "ask_budget" && d.length < 12) return false;
+  return true;
+}
+
+async function handleTypedBarcode(
+  ctx: BotContext,
+  client: ClientData,
+  text: string,
+  businessConnectionId?: string
+): Promise<void> {
+  const digits = onlyDigits(text);
+  const models = modelsStore.getAll();
+  const matched = findModelByDigits(models, digits, false);
+  logger.info(
+    { chatId: client.chatId, digits, matched: matched?.name ?? null },
+    "barcode: mijoz qo'lda yozgan raqam"
+  );
+
+  // So'rovnoma davom etayotgan bo'lsa — uni pauza qilamiz, keyinroq davom etadi.
+  if (client.feedbackStage && client.feedbackStage !== "done") {
+    client.feedbackPausedAt = new Date().toISOString();
+  }
+
+  if (matched) {
+    client.lastModelName = matched.name;
+    client.hasGreeted = true;
+    client.lastInteractionDate = todayStr();
+    client.barcodeAttempts = 0;
+    client.awaitingModelName = false;
+    clientsStore.save(client);
+    modelMentionsStore.record(matched.name, client.chatId);
+    await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
+    return;
+  }
+
+  // Qo'lda yozilgan raqam hech bir modelga mos kelmadi. Bu haqiqiy barcode
+  // bo'lmasligi ham mumkin (masalan telefon raqami), shuning uchun adminni
+  // bezovta qilmaymiz va "noma'lum barcode" deb javob bermaymiz — oddiy
+  // yordam oqimiga o'tamiz, mijoz hech qachon javobsiz qolmaydi.
+  clientsStore.save(client);
+  await handleText(ctx, client, text, businessConnectionId);
+}
+
+// ─── So'rovnoma davomida yo'naltirish ─────────────────────────────────────────
+
+// So'rovnomaning har bir bosqichida mijoz aynan qaysi savolga javob berayotganini
+// (tasnif konteksti uchun) qaytaradi.
+function currentFeedbackQuestion(
+  stage: ClientData["feedbackStage"],
+  language: ClientData["language"]
+): string {
+  const isUz = language !== "ru";
+  switch (stage) {
+    case "ask_region":
+      return isUz ? "Qaysi viloyat yoki shahardan yozyapsiz?" : "Из какого вы города или региона?";
+    case "ask_satisfaction":
+      return isUz ? "Kamerangizdan qoniqayapsizmi? Nima yoqmaydi yoki qiyin bo'ldi?" : "Довольны ли вы камерой? Что не понравилось?";
+    case "ask_wishlist":
+      return isUz ? "Qanday xususiyatlar bo'lsa kamerangiz yanada yaxshi bo'lardi?" : "Какие функции сделали бы камеру лучше?";
+    case "ask_location":
+      return isUz ? "Kamera qayerga o'rnatilgan yoki o'rnatmoqchisiz?" : "Куда установлена или планируется камера?";
+    case "ask_purpose":
+      return isUz ? "Kameradan asosiy maqsad nima?" : "Какова основная цель использования камеры?";
+    case "ask_budget":
+      return isUz ? "Yangi kamera uchun taxminan qancha to'lashingiz mumkin?" : "Сколько вы готовы заплатить за новую камеру?";
+    default:
+      return isUz ? "So'rovnoma savoli" : "Вопрос анкеты";
+  }
+}
+
+// So'rovnoma pauza qilingach, mijozga qayta yo'naltirilganda ishlatiladigan
+// yumshoq qayta-so'rov matni (background task chaqiradi).
+export function feedbackResumePrompt(
+  stage: ClientData["feedbackStage"],
+  language: ClientData["language"]
+): string | null {
+  if (!stage || stage === "done") return null;
+  const isUz = language !== "ru";
+  const prefix = isUz ? "Uzr, avvalgi savolimga qaytsak — " : "Извините, вернёмся к вопросу — ";
+  return prefix + currentFeedbackQuestion(stage, language);
+}
+
+// Mijoz so'rovnoma javobini berayaptimi yoki boshqa narsa (savol/yordam/salom)
+// so'rayaptimi — shuni aniqlab, to'g'ri handlerga yo'naltiradi.
+async function routeDuringFeedback(
+  ctx: BotContext,
+  client: ClientData,
+  text: string,
+  businessConnectionId?: string
+): Promise<void> {
+  const question = currentFeedbackQuestion(client.feedbackStage, client.language);
+  const kind = await classifySurveyReply(question, text);
+
+  if (kind === "other") {
+    // So'rovnomani PAUZA qilamiz (bosqich o'zgarmaydi), xabarni to'g'ri
+    // handlerga yo'naltiramiz — mijozning haqiqiy so'rovi "yutilib" ketmasin.
+    client.feedbackPausedAt = new Date().toISOString();
+    clientsStore.save(client);
+    logger.info({ chatId: client.chatId, stage: client.feedbackStage }, "so'rovnoma pauza qilindi (mijoz boshqa narsa so'radi)");
+    await handleText(ctx, client, text, businessConnectionId);
+    return;
+  }
+
+  await handleFeedback(ctx, client, text, businessConnectionId);
+}
+
 // ─── Feedback javoblari ───────────────────────────────────────────────────────
 
 async function handleFeedback(
@@ -779,6 +971,9 @@ async function handleFeedback(
 ): Promise<void> {
   const isUz = client.language !== "ru";
   const chatId = client.chatId;
+
+  // Mijoz haqiqiy so'rovnoma javobini berdi — pauza holatini tozalaymiz.
+  client.feedbackPausedAt = undefined;
 
   if (!client.feedback) {
     client.feedback = { collectedAt: new Date().toISOString() } as ClientFeedback;
@@ -1011,16 +1206,18 @@ async function handlePhotos(
   }
 
   // Barcode raqamini AVTOMATIK o'qishga harakat qilamiz — avval QR kod
-  // (eng ishonchli, AI chaqirmaydi), keyin AI-OCR fallback. Mijozdan hech
-  // qachon raqamni qo'lda yozib yuborish so'ralmaydi.
+  // (eng ishonchli, AI chaqirmaydi), keyin AI-OCR fallback. QR raqami bazaga
+  // mos kelmasa, to'xtamay bosma raqamni OCR bilan o'qishga o'tadi. Mijozdan
+  // hech qachon raqamni qo'lda yozib yuborish so'ralmaydi.
   await randomDelay(15000, 40000);
 
-  const barcodeResult = await readBarcodeFromImage(clientImages[0]!, chatId);
+  const outcome = await readBarcodeFromImage(clientImages[0]!, chatId, (digits, isPartial) =>
+    !!findModelByDigits(models, digits, isPartial)
+  );
   client = clientsStore.getById(client.chatId) ?? client;
 
-  if (barcodeResult.barcode && barcodeResult.method) {
-    const matchedModel = findModelByBarcode(models, barcodeResult.barcode, barcodeResult.method);
-
+  if (outcome.match) {
+    const matchedModel = findModelByDigits(models, outcome.match.value, outcome.match.isPartial);
     if (matchedModel) {
       client.lastModelName = matchedModel.name;
       client.hasGreeted = true;
@@ -1031,14 +1228,19 @@ async function handlePhotos(
       await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
       return;
     }
+  }
 
-    // Barcode aniq o'qildi, lekin hech qanday modelga bog'lanmagan —
-    // adminni xabardor qilamiz, mijozni jim qoldirmaymiz.
-    await handleUnknownBarcode(ctx, client, barcodeResult.barcode, businessConnectionId);
+  // Mos model topilmadi. Agar TO'LIQ raqam o'qilgan bo'lsa (QR yoki OCR) —
+  // bu haqiqiy, lekin ro'yxatda yo'q barcode: adminni xabardor qilamiz va
+  // mijozga umumiy yordam beramiz. Rasmni QAYTA SO'RAMAYMIZ (bir marta yordam).
+  if (outcome.bestRead && onlyDigits(outcome.bestRead.value).length >= 8) {
+    client.barcodeAttempts = 0;
+    clientsStore.save(client);
+    await handleUnknownBarcode(ctx, client, outcome.bestRead.value, businessConnectionId);
     return;
   }
 
-  // Barcode hech qanday usul (QR, to'liq OCR, oxirgi-4 OCR) bilan o'qilmadi.
+  // Hech qanday ishonchli raqam o'qilmadi — yaqinroq rasm / model nomi zinapoyasi.
   client.barcodeAttempts = (client.barcodeAttempts ?? 0) + 1;
   clientsStore.save(client);
 
@@ -1050,7 +1252,7 @@ async function handlePhotos(
     // model nomini matn bilan so'raymiz.
     client.awaitingModelName = true;
     clientsStore.save(client);
-    await sendMsg(ctx, chatId, askForModelNameText(client.language), businessConnectionId);
+    await sendMsg(ctx, chatId, askForModelNameText(client.language), businessConnectionId, { allowRepeat: true });
   }
 }
 

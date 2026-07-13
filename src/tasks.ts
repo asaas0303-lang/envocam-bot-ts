@@ -3,6 +3,7 @@ import type { BotContext } from "./types.js";
 import { clientsStore, modelsStore, reportsStore, usageStore } from "./data/store.js";
 import { analyzeFeedback } from "./ai.js";
 import { formatDailyCostSummary } from "./stats.js";
+import { feedbackResumePrompt } from "./handlers/client.js";
 import { getAdminIds } from "./helpers.js";
 import { logger } from "./lib/logger.js";
 
@@ -88,6 +89,27 @@ async function checkFeedbackCollection(bot: Telegraf<BotContext>): Promise<void>
   const now = Date.now();
 
   for (const client of clients) {
+    // So'rovnoma boshlangan-u, mijoz oral-da savol/yordam so'rab pauza
+    // qilingan bo'lsa — biroz tinchlik o'tgach (muammosi hal bo'lgach) o'sha
+    // savolni yumshoqlik bilan qayta beramiz.
+    if (client.feedbackStage && client.feedbackStage !== "done" && client.feedbackPausedAt) {
+      const idleMs = now - new Date(client.lastSeen).getTime();
+      if (idleMs < FEEDBACK_DELAY_MS) continue;
+      const prompt = feedbackResumePrompt(client.feedbackStage, client.language);
+      if (!prompt) { client.feedbackPausedAt = undefined; clientsStore.save(client); continue; }
+      try {
+        const opts = client.businessConnectionId
+          ? ({ business_connection_id: client.businessConnectionId } as object)
+          : {};
+        await bot.telegram.sendMessage(client.chatId, prompt, opts as Parameters<typeof bot.telegram.sendMessage>[2]);
+        client.feedbackPausedAt = undefined;
+        client.feedbackAskedAt = new Date().toISOString();
+        clientsStore.save(client);
+      } catch {
+        // ignore
+      }
+      continue;
+    }
     // Allaqachon boshlangan yoki tugagan
     if (client.feedbackStage) continue;
     // Mijoz bilan hali jiddiy muloqot bo'lmagan (masalan faqat bitta stiker yuborgan)

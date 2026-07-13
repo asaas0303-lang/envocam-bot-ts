@@ -216,6 +216,23 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     }
   });
 
+  // Diagnostika: bazada aynan qaysi barcode raqamlari saqlanganini ko'rsatadi —
+  // shunda admin nima kiritilganini (va nima yetishmayotganini) aniq ko'radi.
+  bot.command("diagbarcode", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    const models = modelsStore.getAll();
+    if (models.length === 0) {
+      await ctx.reply("Hech qanday model yo'q.");
+      return;
+    }
+    const lines = models.map((m) => {
+      const codes = m.barcodes.length > 0 ? m.barcodes.join(", ") : "(barcode yo'q)";
+      return `${m.name} (${m.barcodes.length} ta):\n${codes}`;
+    });
+    const header = `Bazadagi barcode raqamlari (jami ${models.length} ta model):\n\n`;
+    await sendChunkedReply(ctx, header + lines.join("\n\n"));
+  });
+
   bot.command("hisobot", async (ctx) => {
     if (!ctx.from || !isAdmin(ctx.from.id)) return;
     await sendReportNow(bot, String(ctx.from.id));
@@ -889,7 +906,7 @@ function resolveStatsWindow(key: string): { since: Date | undefined; label: stri
 async function sendChunkedReply(
   ctx: BotContext,
   text: string,
-  keyboard: ReturnType<typeof Markup.inlineKeyboard>
+  keyboard?: ReturnType<typeof Markup.inlineKeyboard>
 ): Promise<void> {
   const MAX = 4000;
   const chunks: string[] = [];
@@ -902,7 +919,7 @@ async function sendChunkedReply(
   }
   chunks.push(remaining);
   for (let i = 0; i < chunks.length; i++) {
-    if (i === chunks.length - 1) {
+    if (i === chunks.length - 1 && keyboard) {
       await ctx.reply(chunks[i], keyboard);
     } else {
       await ctx.reply(chunks[i]);

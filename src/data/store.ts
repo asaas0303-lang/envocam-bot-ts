@@ -149,6 +149,7 @@ export interface ClientData {
   feedbackStage?: FeedbackStage;
   feedback?: ClientFeedback;
   feedbackAskedAt?: string;
+  feedbackPausedAt?: string;     // so'rovnoma vaqtida mijoz savol/yordam so'rasa — pauza qilinadi, keyinroq davom ettiriladi
 }
 
 export interface Sample {
@@ -194,6 +195,7 @@ export type AiFunctionName =
   | "answerQuestion"
   | "classifyProductFeedback"
   | "classifyRegion"
+  | "classifySurveyReply"
   | "analyzeInsights"
   | "analyzeFeedback"
   | "extractTextFromImage";
