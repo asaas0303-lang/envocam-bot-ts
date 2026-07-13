@@ -127,6 +127,26 @@ async function processIncomingMessage(
   clientsStore.save(client);
   activityStore.record(chatId);
 
+  // Mijoz yangi xabar yozdi — dedup oynasini tozalaymiz, aks holda oldingi
+  // javob bilan bir xil matn bloklanib, mijoz javobsiz qolishi mumkin edi.
+  clearDedupForChat(chatId);
+
+  // To'liq iz (trace) — jim qolish sabablarini keyinchalik topish uchun.
+  const msgType = msg.voice ? "voice" : msg.photo ? "photo" : msg.text ? "text" : "other";
+  const textPreview = typeof msg.text === "string" ? (msg.text as string).slice(0, 80) : undefined;
+  logger.info(
+    {
+      chatId,
+      type: msgType,
+      text: textPreview,
+      feedbackStage: client.feedbackStage ?? null,
+      awaitingConnectionMethod: !!client.awaitingConnectionMethod,
+      awaitingModelName: !!client.awaitingModelName,
+      lastModelName: client.lastModelName ?? null,
+    },
+    "mijoz xabari keldi"
+  );
+
   // Tur bo'yicha yo'naltirish
   if (msg.voice) {
     await handleVoice(ctx, client, businessConnectionId);
@@ -156,30 +176,27 @@ async function processIncomingMessage(
     // yozgan. Har qanday holatda (so'rovnoma vaqtida ham) barcode sifatida qabul.
     if (isLikelyBarcodeText(text, client.feedbackStage)) {
       runSerialized(chatId, () =>
-        handleTypedBarcode(ctx, client, text, businessConnectionId).catch(async (err) => {
-          logger.error({ err, chatId }, "handleTypedBarcode failed");
-          await sendFallbackError(ctx, client, businessConnectionId);
-        })
+        guardReply(ctx, client, businessConnectionId, "handleTypedBarcode", text, () =>
+          handleTypedBarcode(ctx, client, text, businessConnectionId)
+        )
       );
       return;
     }
     // 2) Ulanish usuli (qisqa/uzoq) kutilyaptimi — so'rovnomadan YUQORI.
     if (client.awaitingConnectionMethod) {
       runSerialized(chatId, () =>
-        handleConnectionMethodAnswer(ctx, client, text, businessConnectionId).catch(async (err) => {
-          logger.error({ err, chatId }, "handleConnectionMethodAnswer failed");
-          await sendFallbackError(ctx, client, businessConnectionId);
-        })
+        guardReply(ctx, client, businessConnectionId, "handleConnectionMethodAnswer", text, () =>
+          handleConnectionMethodAnswer(ctx, client, text, businessConnectionId)
+        )
       );
       return;
     }
     // 3) Model nomi kutilyaptimi.
     if (client.awaitingModelName) {
       runSerialized(chatId, () =>
-        handleModelNameAnswer(ctx, client, text, businessConnectionId).catch(async (err) => {
-          logger.error({ err, chatId }, "handleModelNameAnswer failed");
-          await sendFallbackError(ctx, client, businessConnectionId);
-        })
+        guardReply(ctx, client, businessConnectionId, "handleModelNameAnswer", text, () =>
+          handleModelNameAnswer(ctx, client, text, businessConnectionId)
+        )
       );
       return;
     }
@@ -187,19 +204,17 @@ async function processIncomingMessage(
     // xabar so'rovnoma javobimi yoki mijoz boshqa narsa (savol/yordam) so'rayaptimi.
     if (client.feedbackStage && client.feedbackStage !== "done") {
       runSerialized(chatId, () =>
-        routeDuringFeedback(ctx, client, text, businessConnectionId).catch(async (err) => {
-          logger.error({ err, chatId }, "routeDuringFeedback failed");
-          await sendFallbackError(ctx, client, businessConnectionId);
-        })
+        guardReply(ctx, client, businessConnectionId, "routeDuringFeedback", text, () =>
+          routeDuringFeedback(ctx, client, text, businessConnectionId)
+        )
       );
       return;
     }
     // 5) Oddiy suhbat.
     runSerialized(chatId, () =>
-      handleText(ctx, client, text, businessConnectionId).catch(async (err) => {
-        logger.error({ err, chatId }, "handleText failed");
-        await sendFallbackError(ctx, client, businessConnectionId);
-      })
+      guardReply(ctx, client, businessConnectionId, "handleText", text, () =>
+        handleText(ctx, client, text, businessConnectionId)
+      )
     );
     return;
   }
@@ -327,23 +342,13 @@ async function flushPhotos(chatId: string): Promise<void> {
   // Rasmni qayta ishlashni ham shu mijozning navbatiga qo'yamiz — aks holda
   // mijoz debounce oynasidan tashqarida bir necha rasm yuborsa, bir nechta
   // handlePhotos parallel ishlab, bir xil javobni takror yuborishi mumkin edi.
+  // guardReply mijoz rasmga ham javobsiz qolmasligini kafolatlaydi.
   runSerialized(chatId, async () => {
     const client = clientsStore.getById(chatId);
     if (!client) return;
-    try {
-      await handlePhotos(buf.ctx, client, buf.fileIds, buf.businessConnectionId, buf.caption);
-    } catch (err) {
-      logger.error({ err, chatId }, "handlePhotos failed");
-      try {
-        const errMsg =
-          client.language === "ru"
-            ? "Не удалось обработать фото, попробуйте ещё раз."
-            : "Rasmni qayta ishlab bo'lmadi, birozdan so'ng qayta yuboring.";
-        await sendMsg(buf.ctx, chatId, errMsg, buf.businessConnectionId);
-      } catch {
-        // ignore
-      }
-    }
+    await guardReply(buf.ctx, client, buf.businessConnectionId, "handlePhotos", buf.caption ?? "(rasm)", () =>
+      handlePhotos(buf.ctx, client, buf.fileIds, buf.businessConnectionId, buf.caption)
+    );
   });
 }
 
@@ -372,6 +377,25 @@ function isDuplicateSend(chatId: string, key: string): boolean {
   return false;
 }
 
+// Mijoz YANGI xabar yozganda dedup oynasini tozalaymiz — "mijoz yozdi = yangi
+// javob kerak". Dedup faqat BITTA mijoz kirishiga bir nechta oqim bir xil
+// javobni yuborishini to'sish uchun; u mijozning yangi savoliga javobni
+// bloklamasligi kerak.
+function clearDedupForChat(chatId: string): void {
+  const prefix = `${chatId}|`;
+  for (const k of recentSends.keys()) {
+    if (k.startsWith(prefix)) recentSends.delete(k);
+  }
+}
+
+// Har bir mijozga HAQIQATAN yuborilgan xabarni sanaymiz (dedup tomonidan
+// bloklangani sanalmaydi). guardReply shu hisob orqali "handler mijozga hech
+// narsa yubormadimi" degan holatni aniqlaydi va majburiy fallback beradi.
+const sendCounts = new Map<string, number>();
+function noteSent(chatId: string): void {
+  sendCounts.set(chatId, (sendCounts.get(chatId) ?? 0) + 1);
+}
+
 // ─── Business yoki oddiy xabar yuborish ──────────────────────────────────────
 
 async function sendMsg(
@@ -394,6 +418,7 @@ async function sendMsg(
   } else {
     await ctx.telegram.sendMessage(chatId, text);
   }
+  noteSent(chatId);
 }
 
 // handleText/handleFeedback xatoga uchraganda mijoz butunlay javobsiz
@@ -408,9 +433,84 @@ async function sendFallbackError(
     ? "Kechirasiz, xatolik yuz berdi. Birozdan so'ng qayta yozib ko'ring."
     : "Извините, произошла ошибка. Попробуйте написать чуть позже.";
   try {
-    await sendMsg(ctx, client.chatId, msg, businessConnectionId);
+    await sendMsg(ctx, client.chatId, msg, businessConnectionId, { allowRepeat: true });
   } catch {
     // fallback ham yuborilmasa, qila oladigan narsa yo'q
+  }
+}
+
+// MUTLAQ QOIDA: bot HECH QACHON mijoz xabariga javobsiz qolmasin. Handler
+// biror sababga ko'ra mijozga hech narsa yubormasa — bu yerda majburiy javob
+// beramiz (avval AI orqali, u ham bo'lmasa statik xabar).
+async function sendGuaranteedFallback(
+  ctx: BotContext,
+  client: ClientData,
+  text: string,
+  businessConnectionId?: string
+): Promise<void> {
+  try {
+    const samples = samplesStore.getAll().map((s) => s.text);
+    const reply = await answerQuestion({
+      question: text || "Salom",
+      language: client.language,
+      cameraModel: client.lastModelName ? modelsStore.getByName(client.lastModelName) : undefined,
+      connectionMethod: client.connectionMethod,
+      refundRequested: client.refundRequested,
+      firstName: client.firstName,
+      shouldGreet: false,
+      history: client.messageHistory || [],
+      samples,
+    });
+    const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
+    if (parts.length > 0) {
+      addToHistory(client, "user", text);
+      addToHistory(client, "assistant", reply);
+      client.hasGreeted = true;
+      client.lastInteractionDate = todayStr();
+      clientsStore.save(client);
+      for (const part of parts) {
+        await sendMsg(ctx, client.chatId, part, businessConnectionId, { allowRepeat: true });
+        if (parts.length > 1) await sleep(800);
+      }
+      return;
+    }
+  } catch (err) {
+    logger.error({ err, chatId: client.chatId }, "sendGuaranteedFallback: AI javob bermadi");
+  }
+  const msg = client.language !== "ru"
+    ? "Kechirasiz, savolingizni to'liq tushunmadim. Muammoni biroz batafsilroq yozib bera olasizmi?"
+    : "Извините, я не совсем понял. Опишите, пожалуйста, проблему подробнее.";
+  await sendMsg(ctx, client.chatId, msg, businessConnectionId, { allowRepeat: true });
+}
+
+// Har bir mijoz xabari uchun handlerni o'rab ishlatadi: xatoni ushlaydi,
+// handler tugagach mijozga BIRORTA ham xabar yuborilmaganini tekshiradi va
+// bunday holatni ERROR sifatida loglab, majburiy fallback yuboradi. Shunday
+// qilib mijoz hech qachon javobsiz qolmaydi (P1 kafolati).
+async function guardReply(
+  ctx: BotContext,
+  client: ClientData,
+  businessConnectionId: string | undefined,
+  label: string,
+  text: string,
+  fn: () => Promise<void>
+): Promise<void> {
+  const chatId = client.chatId;
+  const before = sendCounts.get(chatId) ?? 0;
+  try {
+    await fn();
+  } catch (err) {
+    logger.error({ err, chatId, label }, `${label}: xatolik`);
+    await sendFallbackError(ctx, client, businessConnectionId);
+    return;
+  }
+  const after = sendCounts.get(chatId) ?? 0;
+  if (after === before) {
+    logger.error({ chatId, label, text }, `${label}: mijozga HECH NARSA yuborilmadi — majburiy fallback`);
+    const fresh = clientsStore.getById(chatId) ?? client;
+    await sendGuaranteedFallback(ctx, fresh, text, businessConnectionId);
+  } else {
+    logger.info({ chatId, label }, `${label}: javob yuborildi`);
   }
 }
 
@@ -432,6 +532,7 @@ async function sendVideoMsg(
   } else {
     await ctx.telegram.sendVideo(chatId, fileId, caption ? { caption } : {});
   }
+  noteSent(chatId);
 }
 
 async function sendVoiceMsg(
@@ -449,6 +550,7 @@ async function sendVoiceMsg(
   } else {
     await ctx.telegram.sendVoice(chatId, fileId);
   }
+  noteSent(chatId);
 }
 
 async function sendPhotoMsg(
@@ -474,6 +576,7 @@ async function sendPhotoMsg(
   } else {
     await ctx.telegram.sendPhoto(chatId, fileId, caption ? { caption } : {});
   }
+  noteSent(chatId);
 }
 
 // ─── Ulash usuli (qisqa/uzoq masofa) ──────────────────────────────────────────
@@ -528,12 +631,11 @@ async function sendShortRangeGuide(
       await sendVideoMsg(ctx, chatId, v.file_id, cap, businessConnectionId);
     }
 
-    await sleep(1500);
-    const connectMsg = isUz
-      ? "Kamerani ulashga muvaffaq bo'ldingizmi?"
-      : "Вам удалось подключить камеру?";
-    await sendMsg(ctx, chatId, connectMsg, businessConnectionId);
-    addToHistory(client, "assistant", firstCaption + "\n" + connectMsg);
+    // Video yuborilgach DARHOL "ishladimi?" deb so'ramaymiz — mijoz videoni
+    // ochib ham ulgurmaydi. Bot jim turadi; kechiktirilgan follow-up
+    // (tasks.ts → checkConnectionFollowups) 30 daqiqadan keyin, faqat mijoz
+    // o'zi yozmagan bo'lsa, so'raydi.
+    addToHistory(client, "assistant", firstCaption);
   } else {
     const confirmText = isUz
       ? `${modelName} kamerasi uchun video yo'riqnoma hali yuklanmagan.`
@@ -574,6 +676,21 @@ async function deliverConnectionGuide(
   } else {
     await sendLongRangeIntro(ctx, client, businessConnectionId);
   }
+}
+
+// Model aniqlanganda mijozga tabiiy tarzda aytamiz — mijoz bot uni tanidimi
+// yo'qmi bilmay qolmasin.
+async function announceModel(
+  ctx: BotContext,
+  client: ClientData,
+  modelName: string,
+  businessConnectionId?: string
+): Promise<void> {
+  const msg = client.language !== "ru"
+    ? `Rasmga qarab aniqladim — sizda ${modelName} kamerasi ekan.`
+    : `По фото определил — у вас камера ${modelName}.`;
+  await sendMsg(ctx, client.chatId, msg, businessConnectionId, { allowRepeat: true });
+  addToHistory(client, "assistant", msg);
 }
 
 // Model aniqlangandan keyin (rasm orqali yoki barcode orqali) ishlatiladi:
@@ -944,6 +1061,8 @@ async function handleTypedBarcode(
     client.awaitingModelName = false;
     clientsStore.save(client);
     modelMentionsStore.record(matched.name, client.chatId);
+    await announceModel(ctx, client, matched.name, businessConnectionId);
+    await sleep(800);
     await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
     return;
   }
@@ -1283,6 +1402,8 @@ async function handlePhotos(
       client.barcodeAttempts = 0;
       clientsStore.save(client);
       modelMentionsStore.record(matchedModel.name, client.chatId);
+      await announceModel(ctx, client, matchedModel.name, businessConnectionId);
+      await sleep(800);
       await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
       return;
     }
@@ -1329,10 +1450,27 @@ async function handleText(
   }
 
   const { intent, connectionMethod, productFeedback } = await detectIntent(text);
+  logger.info(
+    { chatId, intent, connectionMethod: connectionMethod ?? null, productFeedback: productFeedback ?? null },
+    "handleText: detectIntent natijasi"
+  );
 
-  if (connectionMethod && !client.connectionMethod) {
+  // Mijoz ulanish usulini aytdi/O'ZGARTIRDI (masalan qisqa → uzoq). Modeli
+  // aniq bo'lsa — darhol TO'G'RI qo'llanmani yuboramiz (eski qo'llanmani
+  // qayta yubormaymiz).
+  if (connectionMethod) {
+    const changed = client.connectionMethod !== connectionMethod;
     client.connectionMethod = connectionMethod;
     clientsStore.save(client);
+    if (client.lastModelName && (changed || intent === "connect_camera")) {
+      addToHistory(client, "user", text);
+      client.hasGreeted = true;
+      client.lastInteractionDate = todayStr();
+      clientsStore.save(client);
+      logger.info({ chatId, connectionMethod, model: client.lastModelName }, "handleText: ulanish usuli bo'yicha qo'llanma yuborilmoqda");
+      await deliverConnectionGuide(ctx, client, businessConnectionId);
+      return;
+    }
   }
 
   if (intent === "refund_request" && !client.refundRequested) {

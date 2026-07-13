@@ -45,13 +45,21 @@ function extractDigitRuns(text: string, minLen: number): string[] {
 
 // ─── QR kod dekodlash (AI chaqirmaydi, eng arzon va eng ishonchli usul) ───────
 
-async function decodeQrFromBuffer(buffer: Buffer): Promise<string | null> {
+// Bitta rasm bo'lagini jsQR o'qiy oladigan holatga keltiradi: kulrang qilib,
+// kontrast/threshold oshirib, RGBA raw pikselga aylantiradi. jsQR ga
+// "attemptBoth" beramiz — teskari (invert) rangdagi QR ham o'qilsin.
+async function decodeQrRegion(region: sharp.Sharp): Promise<string | null> {
   try {
-    const { data, info } = await sharp(buffer)
+    const { data, info } = await region
+      .grayscale()
+      .normalize()
+      .linear(1.4, -25)   // kontrastni oshirish
       .ensureAlpha()
       .raw()
       .toBuffer({ resolveWithObject: true });
-    const result = jsQR(new Uint8ClampedArray(data), info.width, info.height);
+    const result = jsQR(new Uint8ClampedArray(data), info.width, info.height, {
+      inversionAttempts: "attemptBoth",
+    });
     return result?.data?.trim() || null;
   } catch {
     return null;
@@ -65,31 +73,44 @@ async function tryDecodeQR(base64: string): Promise<string | null> {
   const h = meta.height ?? 0;
   if (!w || !h) return null;
 
-  // Turli variantlarda urinib ko'ramiz — stiker kichik/burchakda bo'lishi mumkin.
-  const variantBuffers: Promise<Buffer>[] = [
-    sharp(original).toBuffer(), // original
-    sharp(original).resize(w * 2, h * 2).toBuffer(), // 2x kattalashtirilgan
-    sharp(original).extract({ // markaz
-      left: Math.floor(w * 0.25), top: Math.floor(h * 0.25),
-      width: Math.floor(w * 0.5), height: Math.floor(h * 0.5),
-    }).resize(w, h).toBuffer(),
-    sharp(original).extract({ // past yarmi (stiker ko'pincha pastda)
-      left: Math.floor(w * 0.1), top: Math.floor(h * 0.5),
-      width: Math.floor(w * 0.8), height: Math.floor(h * 0.5),
-    }).resize(w, h).toBuffer(),
-    sharp(original).extract({ left: 0, top: 0, width: Math.floor(w * 0.5), height: h }).resize(w, h).toBuffer(), // chap
-    sharp(original).extract({ left: Math.floor(w * 0.5), top: 0, width: Math.ceil(w * 0.5), height: h }).resize(w, h).toBuffer(), // o'ng
+  // jsQR haqiqiy quti rasmlarida QR ni ko'pincha topa olmaydi (kichik, past
+  // kontrast). Shuning uchun bir necha variantni sinaymiz — bularning hammasi
+  // CPU'da bajariladi (AI/pul sarflamaydi):
+  //  - butun rasm 2x va 3x kattalashtirilgan
+  //  - markaz, past yarmi, chap/o'ng yarmi (stiker joyi noaniq)
+  //  - 3x3 to'r (grid) — QR katta rasmda kichik bo'lsa, har katakni alohida qidiramiz
+  const targetW = Math.min(1600, w * 3);
+  const scale = targetW / w;
+  const variants: Array<() => sharp.Sharp> = [
+    () => sharp(original).resize(w * 2, h * 2),
+    () => sharp(original).resize(Math.round(w * scale), Math.round(h * scale)),
+    () => sharp(original).extract({ left: Math.floor(w * 0.25), top: Math.floor(h * 0.25), width: Math.floor(w * 0.5), height: Math.floor(h * 0.5) }).resize(w * 2, h * 2),
+    () => sharp(original).extract({ left: Math.floor(w * 0.1), top: Math.floor(h * 0.5), width: Math.floor(w * 0.8), height: Math.floor(h * 0.5) }).resize(w * 2, h),
+    () => sharp(original).extract({ left: 0, top: 0, width: Math.floor(w * 0.5), height: h }).resize(w, h * 2),
+    () => sharp(original).extract({ left: Math.floor(w * 0.5), top: 0, width: Math.ceil(w * 0.5), height: h }).resize(w, h * 2),
   ];
 
-  for (const variantPromise of variantBuffers) {
-    try {
-      const buf = await variantPromise;
-      const found = await decodeQrFromBuffer(buf);
-      if (found) return found;
-    } catch {
-      continue;
+  for (const make of variants) {
+    const found = await decodeQrRegion(make());
+    if (found) return found;
+  }
+
+  // 3x3 to'r — har bir katakni 3x kattalashtirib qidiramiz.
+  const cols = 3, rows = 3;
+  const cw = Math.floor(w / cols);
+  const ch = Math.floor(h / rows);
+  if (cw > 20 && ch > 20) {
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const tile = sharp(original)
+          .extract({ left: c * cw, top: r * ch, width: cw, height: ch })
+          .resize(cw * 3, ch * 3);
+        const found = await decodeQrRegion(tile);
+        if (found) return found;
+      }
     }
   }
+
   return null;
 }
 

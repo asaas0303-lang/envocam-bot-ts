@@ -8,7 +8,7 @@ import { getAdminIds } from "./helpers.js";
 import { logger } from "./lib/logger.js";
 
 const REVIEW_DELAY_MS = 10 * 60 * 60 * 1000;    // 10 soat
-const FOLLOWUP_DELAY_MS = 60 * 60 * 1000;        // 1 soat
+const FOLLOWUP_DELAY_MS = 30 * 60 * 1000;        // 30 daqiqa
 const FEEDBACK_DELAY_MS = 3 * 60 * 60 * 1000;    // 3 soat
 
 export function startBackgroundTasks(bot: Telegraf<BotContext>): void {
@@ -64,6 +64,14 @@ async function checkConnectionFollowups(bot: Telegraf<BotContext>): Promise<void
 
     const videoSentAt = new Date(client.lastVideoSentAt).getTime();
     if (now - videoSentAt < FOLLOWUP_DELAY_MS) continue;
+
+    // Mijoz videodan keyin O'ZI yozgan bo'lsa — follow-up UMUMAN yubormaymiz
+    // (u allaqachon suhbatga qaytgan). Belgilab qo'yamiz, qayta tekshirilmasin.
+    if (new Date(client.lastSeen).getTime() > videoSentAt + 5000) {
+      client.connectionFollowupSentAt = new Date().toISOString();
+      clientsStore.save(client);
+      continue;
+    }
 
     try {
       const msg =
