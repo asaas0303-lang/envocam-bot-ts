@@ -157,6 +157,9 @@ async function processIncomingMessage(
   if (msg.photo) {
     const photos = msg.photo as Array<{ file_id: string }>;
     const caption = typeof msg.caption === "string" ? msg.caption : undefined;
+    // Rasm kelgan vaqtni belgilaymiz — matn oqimi "rasm yuboring" deb
+    // so'ramasligi uchun (poyga holati: matn va rasm oqimlari bir-birini bilmaydi).
+    lastPhotoAtMap.set(chatId, Date.now());
     bufferPhoto(ctx, chatId, photos[photos.length - 1].file_id, businessConnectionId, caption);
     return;
   }
@@ -259,6 +262,19 @@ interface PhotoBuffer {
 }
 
 const photoBuffers = new Map<string, PhotoBuffer>();
+
+// Mijoz oxirgi marta qachon rasm yuborgani (poyga holatini oldini olish uchun).
+const lastPhotoAtMap = new Map<string, number>();
+
+// Mijozdan rasm so'rash o'rinlimi — agar u hozirgina rasm yuborgan bo'lsa
+// (oxirgi 60 soniyada) yoki rasm hozir buferda/navbatda ishlanayotgan bo'lsa,
+// "rasm yuboring" deb so'ramaymiz (absurd bo'lardi).
+function shouldAskForPhoto(chatId: string): boolean {
+  if (photoBuffers.has(chatId)) return false;
+  const last = lastPhotoAtMap.get(chatId);
+  if (last && Date.now() - last < 60_000) return false;
+  return true;
+}
 
 function bufferPhoto(
   ctx: BotContext,
@@ -583,6 +599,17 @@ async function guardReply(
     await sendGuaranteedFallback(ctx, fresh, text, businessConnectionId);
   } else {
     logger.info({ chatId, label }, `${label}: javob yuborildi`);
+    // Bot mijozga BIRINCHI marta biror narsa yubordi — qaysi oqim orqali
+    // bo'lishidan qat'i nazar (matn, rasm, barcode, video) hasGreeted=true
+    // qilamiz. Aks holda salomlashish keyinroq, suhbat o'rtasida noo'rin
+    // ishga tushardi (XATO 4).
+    if (!client.hasGreeted) {
+      const fresh = clientsStore.getById(chatId);
+      if (fresh && !fresh.hasGreeted) {
+        fresh.hasGreeted = true;
+        clientsStore.save(fresh);
+      }
+    }
     // Eslatma: tiqilish hisoblagichini (unresolvedCount) BU YERDA tozalamaymiz —
     // "tushunmadim, qayta so'rayman" kabi yumshoq-nosozlik ham xabar yuboradi,
     // shuning uchun har qanday yuborishni "muvaffaqiyat" deb hisoblab bo'lmaydi.
@@ -828,7 +855,18 @@ async function deliverConnectionGuide(
   if (client.connectionMethod === "short") {
     await sendShortRangeGuide(ctx, client, businessConnectionId);
   } else {
-    await sendLongRangeIntro(ctx, client, businessConnectionId);
+    // MUTLAQ QOIDA: uzoq masofa allaqachon boshlangan bo'lsa (asked_status yoki
+    // guiding), INTRO ni QAYTA yubormaymiz — progressni yo'qotib, mijozni
+    // boshiga qaytarardi. Buni yuqoridagi routeText ham oldini oladi, lekin bu
+    // yerda ham himoya qo'yamiz.
+    if (client.longRangeStage === "guiding") {
+      await runLongRangeGuiding(ctx, client, "davom etamiz", false, businessConnectionId);
+    } else if (client.longRangeStage === "asked_status") {
+      // Savol allaqachon berilgan — qayta so'ramaymiz.
+      return;
+    } else {
+      await sendLongRangeIntro(ctx, client, businessConnectionId);
+    }
   }
 }
 
@@ -1018,9 +1056,17 @@ async function askConnectionMethodOrDeliver(
 async function handleConnectCameraRequest(
   ctx: BotContext,
   client: ClientData,
+  text: string,
   businessConnectionId?: string
 ): Promise<void> {
   const chatId = client.chatId;
+
+  // Uzoq masofa allaqachon boshlangan bo'lsa — INTRO ni qayta yubormaymiz,
+  // holat mashinasida davom etamiz (progress yo'qolmasin).
+  if (client.longRangeStage) {
+    await handleLongRange(ctx, client, text, businessConnectionId);
+    return;
+  }
 
   if (!client.connectionMethod) {
     const asks = client.connectionMethodAsks ?? 0;
@@ -1043,7 +1089,7 @@ async function handleConnectCameraRequest(
   }
 
   if (!client.lastModelName) {
-    if (!client.askedForPhotoOnce) {
+    if (!client.askedForPhotoOnce && shouldAskForPhoto(chatId)) {
       client.askedForPhotoOnce = true;
       clientsStore.save(client);
       await sendMsg(ctx, chatId, askForCameraPhotoText(client.language), businessConnectionId);
@@ -1058,6 +1104,8 @@ async function handleConnectCameraRequest(
 // mijoz ko'pincha bu savolga javob bermay, o'z muammosini aytadi ("kamera
 // o'chib qolayapti", "tasvir xira" va h.k.) — bunday holda savolni QAYTA
 // SO'RAMASDAN, muammoga javob beramiz. Savol maksimum 2 marta so'raladi.
+const NO_PREFERENCE_RE = /(farqi yo'?q|farqi yoq|baribir|farqsiz|bari bir|без разниц|всё равно|все равно|любой|неважно|не важно)/i;
+
 async function handleConnectionMethodAnswer(
   ctx: BotContext,
   client: ClientData,
@@ -1066,16 +1114,20 @@ async function handleConnectionMethodAnswer(
 ): Promise<void> {
   const { connectionMethod, intent, productFeedback } = await detectIntent(text);
 
+  // Mijoz "menga farqi yo'q / без разницы" desa — savolni takrorlamay, standart
+  // variantni (uzoq masofa — eng ko'p so'raladigan) tanlab davom etamiz.
+  const effectiveMethod = connectionMethod ?? (NO_PREFERENCE_RE.test(text) ? "long" : null);
+
   // Mijoz aniq qisqa/uzoq javob berdi → davom etamiz.
-  if (connectionMethod) {
-    client.connectionMethod = connectionMethod;
+  if (effectiveMethod) {
+    client.connectionMethod = effectiveMethod;
     client.awaitingConnectionMethod = false;
     client.connectionMethodAsks = 0;
     resetStuck(client);
     clientsStore.save(client);
 
     if (!client.lastModelName) {
-      if (!client.askedForPhotoOnce) {
+      if (!client.askedForPhotoOnce && shouldAskForPhoto(client.chatId)) {
         client.askedForPhotoOnce = true;
         clientsStore.save(client);
         await sendMsg(ctx, client.chatId, askForCameraPhotoText(client.language), businessConnectionId);
@@ -1870,7 +1922,7 @@ async function handleText(
     client.hasGreeted = true;
     client.lastInteractionDate = todayStr();
     clientsStore.save(client);
-    await handleConnectCameraRequest(ctx, client, businessConnectionId);
+    await handleConnectCameraRequest(ctx, client, text, businessConnectionId);
     return;
   }
 
@@ -1904,7 +1956,7 @@ async function handleText(
     if (parts.length > 1) await sleep(800);
   }
 
-  if (!cameraModel && !client.askedForPhotoOnce) {
+  if (!cameraModel && !client.askedForPhotoOnce && shouldAskForPhoto(chatId)) {
     client.askedForPhotoOnce = true;
     clientsStore.save(client);
     await sendMsg(ctx, chatId, askForCameraPhotoText(client.language), businessConnectionId);

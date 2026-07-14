@@ -97,16 +97,68 @@ async function notifyLowCreditIfNeeded(err: unknown): Promise<void> {
   ).catch(() => {});
 }
 
+// Javobdagi BARCHA matn bloklarini birlashtiradi. MUHIM: model bir nechta
+// content bloki qaytarishi mumkin va birinchisi matn bo'lmasligi mumkin —
+// shuning uchun response.content[0] ga tayanish XATO (matnni yo'qotadi va
+// mijoz javobsiz qoladi). Bu yordamchi barcha "text" bloklarini yig'adi.
+function extractText(response: Anthropic.Message): string {
+  return response.content
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
+
+// Suhbat tarixini Anthropic API talablariga moslaydi va AI'ga uzatiladigan
+// xabarlar ro'yxatini quradi. Anthropic BIRINCHI xabar role="user" bo'lishini
+// TALAB qiladi — aks holda 400 xato → bo'sh javob → mijoz jim qoladi.
+// (assistant xabar mijoz xabarisiz ham qo'shilishi mumkin, masalan
+// sendLongRangeIntro'da — shuning uchun bu tozalash zarur.)
+function buildMessages(
+  history: MessageRecord[],
+  question: string
+): { role: "user" | "assistant"; content: string }[] {
+  const cleaned = history
+    .filter((m) => typeof m.content === "string" && m.content.trim())
+    .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
+
+  // Boshidagi barcha "assistant" xabarlarni tashlaymiz — birinchi "user" dan boshlanadi.
+  let start = 0;
+  while (start < cleaned.length && cleaned[start].role !== "user") start++;
+  const trimmed = cleaned.slice(start);
+
+  // Oxiridagi user xabari aynan savolning o'zi bo'lsa — takrorlamaymiz.
+  const last = trimmed[trimmed.length - 1];
+  if (last && last.role === "user" && last.content === question) return trimmed;
+  return [...trimmed, { role: "user", content: question }];
+}
+
 // Barcha Anthropic chaqiruvlari shu orqali o'tadi — har bir chaqiruvdan
 // keyin token/narx qayd etiladi, xato bo'lsa (masalan kredit tugagan bo'lsa)
-// adminga darhol xabar beriladi.
+// adminga darhol xabar beriladi. Javobda matn bloki umuman bo'lmasa —
+// strukturani loglab, BIR MARTA qayta urinadi (bo'sh javob = mijoz jim qoladi).
 async function callClaude(
   fn: AiFunctionName,
   params: Anthropic.MessageCreateParamsNonStreaming
 ): Promise<Anthropic.Message> {
   try {
-    const response = await anthropic.messages.create(params);
+    let response = await anthropic.messages.create(params);
     recordUsage(fn, response.usage);
+
+    if (extractText(response) === "") {
+      logger.error(
+        { fn, stopReason: response.stop_reason, content: JSON.stringify(response.content).slice(0, 500) },
+        "callClaude: javobda matn bloki yo'q — qayta urinilyapti"
+      );
+      response = await anthropic.messages.create(params);
+      recordUsage(fn, response.usage);
+      if (extractText(response) === "") {
+        logger.error(
+          { fn, stopReason: response.stop_reason, content: JSON.stringify(response.content).slice(0, 500) },
+          "callClaude: qayta urinishdan keyin ham matn yo'q"
+        );
+      }
+    }
     return response;
   } catch (err) {
     await notifyLowCreditIfNeeded(err);
@@ -161,12 +213,12 @@ export async function readBarcodeDigits(
     ],
   });
 
-  const block = response.content[0];
-  if (block.type !== "text") return null;
+  const raw = extractText(response);
+  if (!raw) return null;
   // Xom natijani (AI aynan nima yozganini) loglaymiz — Railway logida
   // qanday o'qilayotganini aniq ko'rish uchun.
-  logger.info({ mode, rawOcr: block.text }, "barcode: AI-OCR xom natijasi");
-  const digits = block.text.replace(/\D/g, "");
+  logger.info({ mode, rawOcr: raw }, "barcode: AI-OCR xom natijasi");
+  const digits = raw.replace(/\D/g, "");
   if (mode === "full") return digits.length >= 8 ? digits : null;
   return digits.length === 4 ? digits : null;
 }
@@ -200,9 +252,7 @@ Faqat JSON qaytar: {"kind":"survey_answer|other"}`,
       ],
     });
 
-    const block = response.content[0];
-    if (block.type !== "text") return "survey_answer";
-    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    const jsonMatch = extractText(response).match(/\{[\s\S]*\}/);
     if (!jsonMatch) return "survey_answer";
     const parsed = JSON.parse(jsonMatch[0]) as { kind?: string };
     return parsed.kind === "other" ? "other" : "survey_answer";
@@ -241,9 +291,7 @@ Faqat JSON: {"kind":"start_over|already_added|unclear"}`,
         },
       ],
     });
-    const block = response.content[0];
-    if (block.type !== "text") return "unclear";
-    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    const jsonMatch = extractText(response).match(/\{[\s\S]*\}/);
     if (!jsonMatch) return "unclear";
     const parsed = JSON.parse(jsonMatch[0]) as { kind?: string };
     if (parsed.kind === "start_over" || parsed.kind === "already_added") return parsed.kind;
@@ -283,6 +331,7 @@ QOIDALAR:
 - Har bir javob 1-3 qisqa jumladan oshmasin.
 - ${fromStart ? "Mijoz BOSHIDAN boshlayapti — birinchi qadamdan boshla." : "Mijoz kamerani ilovaga allaqachon qo'shgan — u aynan nimada qiynalayotganini so'ra va o'sha joydan davom et."}
 - Mijoz "bo'ldi/ha" desa — keyingi qadamga o't. Tushunmasa — o'sha qadamni BOSHQACHA, SODDAROQ tushuntir (bir xil so'zni takrorlama).
+- Mijoz keyinroq/ertaga qilmoqchi bo'lsa yoki "hozir WiFi yo'q" desa — MAJBURLAMA. Iliq javob ber ("Albatta, tayyor bo'lganingizda yozing, davom etamiz") va shu bilan to'xta. Uzoq masofa uy WiFi routeri BO'LISHINI talab qiladi — buni eslatib qo'y.
 - ${SHORTHAND_UZ_NOTE}
 
 ${guideBlock}`
@@ -294,23 +343,18 @@ ${guideBlock}`
 - Каждый ответ — 1-3 коротких предложения.
 - ${fromStart ? "Клиент начинает С НАЧАЛА — начни с первого шага." : "Камера уже добавлена — спроси, что именно не получается, и продолжи оттуда."}
 - Если не понял — объясни ИНАЧЕ, ПРОЩЕ (не повторяй те же слова).
+- Если клиент хочет позже/завтра или говорит «сейчас нет WiFi» — НЕ дави. Ответь тепло («Конечно, напишите, когда будете готовы») и остановись. Дальнее подключение требует домашнего WiFi роутера — напомни об этом.
 
 ${guideBlock}`;
-
-  const historyMessages = history.slice(-16).map((m) => ({
-    role: m.role as "user" | "assistant",
-    content: m.content,
-  }));
 
   const response = await callClaude("answerLongRange", {
     model: MODEL,
     max_tokens: 700,
     system: systemPrompt,
-    messages: [...historyMessages, { role: "user", content: question }],
+    messages: buildMessages(history.slice(-16), question),
   });
 
-  const block = response.content[0];
-  return block.type === "text" ? block.text : "";
+  return extractText(response);
 }
 
 // Mijoz rasm(lar)idan kamera modelini aniqlaydi. ENG ISHONCHLI belgi —
@@ -377,10 +421,9 @@ Faqat JSON qaytar: {"status": "matched|unclear|no_match", "model": "nom yoki nul
     messages: [{ role: "user", content }],
   });
 
-  const block = response.content[0];
-  if (block.type !== "text") return { status: "no_match", model: null };
+  const raw = extractText(response);
   try {
-    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return { status: "no_match", model: null };
     return JSON.parse(jsonMatch[0]) as { status: "matched" | "unclear" | "no_match"; model: string | null };
   } catch {
@@ -425,10 +468,9 @@ Faqat JSON qaytar: {"kind": "camera_or_box|app_screenshot|manual_page|other", "d
   });
 
   const fallback: ImageClassification = { kind: "other", description: "" };
-  const block = response.content[0];
-  if (block.type !== "text") return fallback;
+  const raw = extractText(response);
   try {
-    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return fallback;
     const parsed = JSON.parse(jsonMatch[0]) as { kind?: string; description?: string };
     const validKinds = ["camera_or_box", "app_screenshot", "manual_page", "other"];
@@ -480,10 +522,9 @@ Xabar: "${text}"`,
   });
 
   const fallback: IntentResult = { intent: "question", connectionMethod: null, productFeedback: null };
-  const block = response.content[0];
-  if (block.type !== "text") return fallback;
+  const raw = extractText(response);
   try {
-    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return fallback;
     const parsed = JSON.parse(jsonMatch[0]) as {
       intent?: string;
@@ -534,10 +575,9 @@ Faqat JSON qaytar: {"label": "kategoriya nomi"}`,
     ],
   });
 
-  const block = response.content[0];
-  if (block.type !== "text") return null;
+  const raw = extractText(response);
   try {
-    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return null;
     const parsed = JSON.parse(jsonMatch[0]) as { label?: string };
     const label = parsed.label?.trim();
@@ -567,10 +607,9 @@ Faqat JSON qaytar: {"region": "ro'yxatdagi aynan nom yoki null"}`,
     ],
   });
 
-  const block = response.content[0];
-  if (block.type !== "text") return null;
+  const raw = extractText(response);
   try {
-    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return null;
     const parsed = JSON.parse(jsonMatch[0]) as { region?: string | null };
     const region = parsed.region;
@@ -609,8 +648,7 @@ export async function extractTextFromImage(
       },
     ],
   });
-  const block = response.content[0];
-  return block.type === "text" ? block.text : "";
+  return extractText(response);
 }
 
 // ─── Savollarga javob ─────────────────────────────────────────────────────────
@@ -751,24 +789,14 @@ ${samples.length > 0
     ? systemPrompt + `\n\nMUHIM: Mijoz sizga kirill yozuvida yozmoqda. Javobingizni FAQAT kirill yozuvida yozing (lotin emas) — masalan "Assalomu alaykum" emas "Ассалому алайкум", "Rahmat" emas "Раҳмат" deb yozing.`
     : systemPrompt) + `\n\n${SHORTHAND_UZ_NOTE}` + rephraseNote;
 
-  // ─ Tarix ─
-  const historyMessages = history.slice(-16).map((m) => ({
-    role: m.role as "user" | "assistant",
-    content: m.content,
-  }));
-
   const response = await callClaude("answerQuestion", {
     model: MODEL,
     max_tokens: 1024,
     system: finalSystemPrompt,
-    messages: [
-      ...historyMessages,
-      { role: "user", content: question },
-    ],
+    messages: buildMessages(history.slice(-16), question),
   });
 
-  const block = response.content[0];
-  return block.type === "text" ? block.text : "";
+  return extractText(response);
 }
 
 // ─── Mijoz fikrlarini tahlil qilish ──────────────────────────────────────────
@@ -835,8 +863,7 @@ ${data}`,
     ],
   });
 
-  const block = response.content[0];
-  return block.type === "text" ? block.text : "Tahlil qilishda xatolik yuz berdi.";
+  return extractText(response) || "Tahlil qilishda xatolik yuz berdi.";
 }
 
 // ─── Feedback tahlili (haftalik hisobot) ──────────────────────────────────────
@@ -885,6 +912,5 @@ Hisobot o'zbek tilida, aniq va amaliy bo'lsin. Emoji ishlatma. Boshida "Haftalik
     ],
   });
 
-  const answerBlock = response.content[0];
-  return answerBlock.type === "text" ? answerBlock.text : "Tahlil qilishda xatolik yuz berdi.";
+  return extractText(response) || "Tahlil qilishda xatolik yuz berdi.";
 }
