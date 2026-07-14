@@ -123,6 +123,7 @@ export interface ClientData {
   chatId: string;
   language: "uz" | "uz-cyrl" | "ru";
   firstName?: string;
+  username?: string;             // Telegram @username (bo'lsa) — /testreset qidiruvi uchun
   hasGreeted: boolean;
   askedForPhotoOnce: boolean;
   awaitingConnectionConfirm: boolean;
@@ -311,6 +312,41 @@ export const clientsStore = {
   },
   count(): number {
     return db.clients.length;
+  },
+  // Sinov uchun: mijozning SUHBAT HOLATINI yangi mijozdek qilib tozalaydi.
+  // Kimligi (chatId, ism, username, business ulanishi) va TARIXIY STATISTIKA
+  // (firstSeen, viloyat, to'plangan so'rovnoma) saqlanadi — faqat oqim holati
+  // (hasGreeted, feedbackStage, connectionMethod, messageHistory va h.k.) nolga
+  // qaytadi. Optional holat maydonlari ro'yxatga kiritilmagani uchun undefined
+  // bo'ladi (kelajakda yangi holat maydoni qo'shilsa ham avtomatik tozalanadi).
+  resetState(chatId: string): ClientData | undefined {
+    const idx = db.clients.findIndex((c) => c.chatId === chatId);
+    if (idx < 0) return undefined;
+    const old = db.clients[idx];
+    const fresh: ClientData = {
+      chatId: old.chatId,
+      firstName: old.firstName,
+      username: old.username,
+      businessConnectionId: old.businessConnectionId,
+      firstSeen: old.firstSeen,
+      lastSeen: old.lastSeen,
+      region: old.region,       // statistika — saqlanadi
+      feedback: old.feedback,   // to'plangan so'rovnoma — statistika, saqlanadi
+      // ── quyidagilar yangi mijoz kabi ──
+      language: "uz",
+      hasGreeted: false,
+      askedForPhotoOnce: false,
+      awaitingConnectionConfirm: false,
+      connectionFollowupSentAt: null,
+      reviewSent: false,
+      voiceSent: false,
+      gratitudeSent: false,
+      lastVideoSentAt: null,
+      messageHistory: [],
+    };
+    db.clients[idx] = fresh;
+    persist();
+    return fresh;
   },
 };
 

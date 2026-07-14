@@ -109,13 +109,14 @@ function runSerialized(chatId: string, task: () => Promise<void>): void {
 async function processIncomingMessage(
   ctx: BotContext,
   msg: Record<string, unknown>,
-  from: { id: number; first_name?: string },
+  from: { id: number; first_name?: string; username?: string },
   chatId: string,
   businessConnectionId?: string
 ): Promise<void> {
   if (isAdmin(from.id)) return;
 
   const firstName = from.first_name || undefined;
+  const username = from.username || undefined;
   const msgId = (msg.message_id as number) || 0;
   const client = getOrCreateClient(chatId, firstName);
 
@@ -125,6 +126,7 @@ async function processIncomingMessage(
   client.lastSeen = new Date().toISOString();
   if (businessConnectionId) client.businessConnectionId = businessConnectionId;
   if (firstName && !client.firstName) client.firstName = firstName;
+  if (username) client.username = username;
 
   clientsStore.save(client);
   activityStore.record(chatId);

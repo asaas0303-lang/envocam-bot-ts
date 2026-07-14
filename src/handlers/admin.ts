@@ -14,6 +14,7 @@ import {
   settingsStore,
   usageStore,
   type CameraModel,
+  type ClientData,
 } from "../data/store.js";
 import { isAdmin, downloadFileAsBase64, sleep } from "../helpers.js";
 import { extractTextFromImage, analyzeInsights } from "../ai.js";
@@ -84,6 +85,75 @@ function short(text: string | undefined, max = 28): string {
 function onlyDigits(s: string): string {
   return s.replace(/\D/g, "");
 }
+
+// ─── /testreset yordamchilari ─────────────────────────────────────────────────
+
+// Har bir admin oxirgi ko'rgan ro'yxat (chatId'lar tartibi) — "/testreset 1"
+// kabi raqamli tanlovni hal qilish uchun.
+const testResetLists = new Map<number, string[]>();
+
+function recentClients(n: number): ClientData[] {
+  return [...clientsStore.getAll()]
+    .sort((a, b) => new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime())
+    .slice(0, n);
+}
+
+// Mijozning oxirgi yozgan MATNINI qaytaradi (bo'lmasa "").
+function lastUserText(c: ClientData): string {
+  const hist = c.messageHistory || [];
+  for (let i = hist.length - 1; i >= 0; i--) {
+    if (hist[i].role === "user" && hist[i].content?.trim()) return hist[i].content;
+  }
+  return "";
+}
+
+function relativeTime(iso: string): string {
+  const d = new Date(iso);
+  const nowUZ = new Date(Date.now() + 5 * 60 * 60 * 1000);
+  const dUZ = new Date(d.getTime() + 5 * 60 * 60 * 1000);
+  const hhmm = dUZ.toISOString().slice(11, 16);
+  const day = dUZ.toISOString().slice(0, 10);
+  const today = nowUZ.toISOString().slice(0, 10);
+  const yesterday = new Date(nowUZ.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  if (day === today) return `bugun ${hhmm}`;
+  if (day === yesterday) return `kecha ${hhmm}`;
+  return `${day} ${hhmm}`;
+}
+
+// Ro'yxat qatori: "...484 — Aziz — bugun 13:27 — "kamera ishlamayapti""
+function clientLabel(c: ClientData): string {
+  const idTail = "..." + c.chatId.slice(-4);
+  const name = c.firstName?.trim() ? c.firstName.trim() : (c.username ? "@" + c.username : "(ismsiz)");
+  const when = relativeTime(c.lastSeen);
+  const msg = lastUserText(c);
+  const tail = msg ? `"${short(msg, 30)}"` : "(stiker/rasm)";
+  return `${idTail} — ${name} — ${when} — ${tail}`;
+}
+
+async function doTestReset(ctx: BotContext, chatId: string): Promise<void> {
+  const before = clientsStore.getById(chatId);
+  const name = before?.firstName?.trim() || (before?.username ? "@" + before.username : chatId);
+  const fresh = clientsStore.resetState(chatId);
+  if (!fresh) {
+    await ctx.reply(`chatId "${chatId}" topilmadi.`);
+    return;
+  }
+  await ctx.reply(`✅ ${name} uchun holat tozalandi — endi yangi mijozdek suhbat boshlanadi.`);
+}
+
+const ADMIN_HELP_TEXT = [
+  "📋 Admin buyruqlari:",
+  "",
+  "/panel — asosiy admin panel (model qo'shish/tahrirlash, kontent, namuna rasm, statistika, API balans)",
+  "/version — hozir deploy qilingan commit'ni ko'rsatadi",
+  "/diag — barcha modellar va ularning bo'sh kontent kategoriyalari; /diag <model> — shu model bo'yicha batafsil (rasmlar, kollaj) diagnostika",
+  "/diagbarcode — bazadagi barcha barcode raqamlarini va to'qnashuvlarni ko'rsatadi",
+  "/hisobot — mijoz fikrlari bo'yicha AI haftalik hisobotni HOZIR yuboradi",
+  "/stats — statistika menyusini ochadi (joylashuv, muammolar, modellar va h.k.)",
+  "/xarajat — API xarajat hisoboti (bugungi/7 kunlik/jami sarf, qolgan balans, taxminiy kunlar)",
+  "/testreset — bitta mijozning suhbat holatini yangi mijozdek tozalaydi (sinov uchun). Argumentsiz — oxirgi 15 mijoz ro'yxati; /testreset <raqam> — ro'yxatdan tanlash; /testreset <ism/matn> — qidirish; /testreset <chatId> — to'g'ridan-to'g'ri",
+  "/yordam — shu ro'yxat",
+].join("\n");
 
 // ─── Kategoriya ro'yxat menyu ─────────────────────────────────────────────────
 
@@ -285,6 +355,81 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     await ctx.reply(text, Markup.inlineKeyboard([
       [Markup.button.callback("API balans", "admin_api_balance")],
     ]));
+  });
+
+  // ── Sinov uchun: bitta mijozning suhbat holatini tozalash ──
+  bot.command("testreset", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    const adminId = ctx.from.id;
+    const rawText = ("text" in ctx.message ? ctx.message.text : "") as string;
+    const arg = rawText.replace(/^\/testreset(@\S+)?\s*/i, "").trim();
+
+    // (1) Argumentsiz — oxirgi 15 faol mijozni raqamlangan ro'yxat qilib ko'rsatamiz.
+    if (!arg) {
+      const recent = recentClients(15);
+      if (recent.length === 0) {
+        await ctx.reply("Hozircha mijozlar yo'q.");
+        return;
+      }
+      testResetLists.set(adminId, recent.map((c) => c.chatId));
+      const lines = recent.map((c, i) => `${i + 1}. ${clientLabel(c)}`);
+      await ctx.reply(
+        "Qaysi mijozning holatini tozalaymiz? Raqamini yuboring (masalan /testreset 1):\n\n" + lines.join("\n")
+      );
+      return;
+    }
+
+    // (2) 1-2 xonali raqam VA oldin ro'yxat ko'rsatilgan bo'lsa — ro'yxat indeksi.
+    const list = testResetLists.get(adminId);
+    if (/^\d{1,2}$/.test(arg) && list && Number(arg) >= 1 && Number(arg) <= list.length) {
+      const chatId = list[Number(arg) - 1];
+      await doTestReset(ctx, chatId);
+      return;
+    }
+
+    // (3) To'liq raqam (kamida 5 xonali) — to'g'ridan-to'g'ri chatId.
+    if (/^\d{5,}$/.test(arg)) {
+      const client = clientsStore.getById(arg);
+      if (!client) {
+        await ctx.reply(`chatId "${arg}" topilmadi. Ro'yxatni ko'rish uchun /testreset (argumentsiz) yuboring.`);
+        return;
+      }
+      await doTestReset(ctx, arg);
+      return;
+    }
+
+    // (4) Matn — ism, username yoki oxirgi xabar matni bo'yicha qidiruv.
+    const needle = arg.toLowerCase();
+    const matches = clientsStore.getAll().filter((c) => {
+      const name = (c.firstName ?? "").toLowerCase();
+      const uname = (c.username ?? "").toLowerCase();
+      const lastMsg = lastUserText(c).toLowerCase();
+      return name.includes(needle) || uname.includes(needle) || lastMsg.includes(needle);
+    });
+
+    if (matches.length === 0) {
+      await ctx.reply(`"${arg}" bo'yicha hech narsa topilmadi. Ro'yxatni ko'rish uchun /testreset (argumentsiz) yuboring.`);
+      return;
+    }
+    if (matches.length === 1) {
+      await doTestReset(ctx, matches[0].chatId);
+      return;
+    }
+    // Bir nechta mos keldi — raqamlangan ro'yxat, admin aniqrog'ini tanlaydi.
+    const top = matches
+      .sort((a, b) => new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime())
+      .slice(0, 15);
+    testResetLists.set(adminId, top.map((c) => c.chatId));
+    const lines = top.map((c, i) => `${i + 1}. ${clientLabel(c)}`);
+    await ctx.reply(
+      `"${arg}" bo'yicha ${matches.length} ta mos keldi. Raqamini tanlang (masalan /testreset 1):\n\n` + lines.join("\n")
+    );
+  });
+
+  // ── Barcha admin buyruqlari ro'yxati ──
+  bot.command("yordam", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.reply(ADMIN_HELP_TEXT);
   });
 
   // ── Statistika ──
