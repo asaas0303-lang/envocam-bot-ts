@@ -141,6 +141,12 @@ export interface ClientData {
   connectionMethod?: "short" | "long";
   awaitingConnectionMethod?: boolean;
   connectionMethodAsks?: number; // ulanish usuli savoli necha marta so'ralgan (max 2, keyin tashlanadi)
+  // Uzoq masofa (router orqali) ulash — video yo'q, bosqichma-bosqich matnli
+  // yordam. "asked_status" — "ilovada qo'shilganmi/boshidanmi?" so'raldi;
+  // "guiding" — bosqichma-bosqich yordam berilyapti.
+  longRangeStage?: "asked_status" | "guiding";
+  unresolvedCount?: number;      // ketma-ket "tushunmadim/yordam berolmadim" soni (adminni ogohlantirish uchun)
+  stuckAdminNotified?: boolean;  // shu tiqilish uchun admin allaqachon xabardor qilinganmi
   barcodeAttempts?: number;      // nechta marta "yaqinroq rasm" so'ralgan
   awaitingModelName?: boolean;   // barcode aniqlanmagach, oxirgi chora — model nomini matn bilan so'rash
   refundRequested?: boolean;
@@ -197,6 +203,8 @@ export type AiFunctionName =
   | "classifyProductFeedback"
   | "classifyRegion"
   | "classifySurveyReply"
+  | "classifyLongRangeAnswer"
+  | "answerLongRange"
   | "analyzeInsights"
   | "analyzeFeedback"
   | "extractTextFromImage";

@@ -29,6 +29,8 @@ import {
   classifyRegion,
   classifyImage,
   classifySurveyReply,
+  classifyLongRangeAnswer,
+  answerLongRangeStep,
   type ImageClassification,
 } from "../ai.js";
 import { readBarcodeFromImage } from "../barcode.js";
@@ -160,62 +162,11 @@ async function processIncomingMessage(
   }
   if (msg.text) {
     const text = msg.text as string;
-    // handleText/handleFeedback/handleConnectionMethodAnswer ataylab kechikadi
-    // (AI javobi + "inson kabi yozayapti" pauzasi, 15-70 soniyagacha). Telegraf
-    // keyingi yangilanishlarni shu update to'liq tugagach so'raydi, shuning
-    // uchun bularni KUTMASDAN ishga tushiramiz — aks holda shu vaqt ichida
-    // yozgan boshqa mijozlarning xabarlari umuman olinmay qoladi. runSerialized
-    // shu mijoz uchun xabarlar ketma-ket (parallel emas) ishlanishini
-    // kafolatlaydi.
-    // USTUVORLIK TARTIBI (muhim): mijozning JORIY ehtiyoji har doim
-    // so'rovnomadan ustun. Shuning uchun barcode → ulanish usuli → model nomi
-    // holatlari avval tekshiriladi, so'rovnoma (feedbackStage) esa ENG OXIRIDA
-    // — faqat boshqa hech narsa kutilmayotgan bo'lsa.
-
-    // 1) FAQAT raqamlardan iborat (uzun) matn — mijoz barcode raqamini qo'lda
-    // yozgan. Har qanday holatda (so'rovnoma vaqtida ham) barcode sifatida qabul.
-    if (isLikelyBarcodeText(text, client.feedbackStage)) {
-      runSerialized(chatId, () =>
-        guardReply(ctx, client, businessConnectionId, "handleTypedBarcode", text, () =>
-          handleTypedBarcode(ctx, client, text, businessConnectionId)
-        )
-      );
-      return;
-    }
-    // 2) Ulanish usuli (qisqa/uzoq) kutilyaptimi — so'rovnomadan YUQORI.
-    if (client.awaitingConnectionMethod) {
-      runSerialized(chatId, () =>
-        guardReply(ctx, client, businessConnectionId, "handleConnectionMethodAnswer", text, () =>
-          handleConnectionMethodAnswer(ctx, client, text, businessConnectionId)
-        )
-      );
-      return;
-    }
-    // 3) Model nomi kutilyaptimi.
-    if (client.awaitingModelName) {
-      runSerialized(chatId, () =>
-        guardReply(ctx, client, businessConnectionId, "handleModelNameAnswer", text, () =>
-          handleModelNameAnswer(ctx, client, text, businessConnectionId)
-        )
-      );
-      return;
-    }
-    // 4) So'rovnoma davom etyaptimi? routeDuringFeedback yana bir bor tekshiradi:
-    // xabar so'rovnoma javobimi yoki mijoz boshqa narsa (savol/yordam) so'rayaptimi.
-    if (client.feedbackStage && client.feedbackStage !== "done") {
-      runSerialized(chatId, () =>
-        guardReply(ctx, client, businessConnectionId, "routeDuringFeedback", text, () =>
-          routeDuringFeedback(ctx, client, text, businessConnectionId)
-        )
-      );
-      return;
-    }
-    // 5) Oddiy suhbat.
-    runSerialized(chatId, () =>
-      guardReply(ctx, client, businessConnectionId, "handleText", text, () =>
-        handleText(ctx, client, text, businessConnectionId)
-      )
-    );
+    // Matn xabarlarini qisqa bufer bilan yig'amiz — mijoz ketma-ket bir necha
+    // qisqa xabar yozsa (masalan "yoq", "bowidan", "boshidan"), ularni
+    // BIRLASHTIRIB bitta kontekst sifatida ishlaymiz va BITTA javob beramiz.
+    // Yo'naltirish (routeText) bufer to'lgach, ENG YANGI holat bilan bajariladi.
+    bufferText(ctx, chatId, text, businessConnectionId);
     return;
   }
 
@@ -352,6 +303,107 @@ async function flushPhotos(chatId: string): Promise<void> {
   });
 }
 
+// ─── Matn bufferi (ketma-ket kelgan qisqa xabarlar) ───────────────────────────
+
+const TEXT_DEBOUNCE_MS = 6000;
+
+interface TextBuffer {
+  texts: string[];
+  timer: ReturnType<typeof setTimeout>;
+  ctx: BotContext;
+  businessConnectionId?: string;
+}
+
+const textBuffers = new Map<string, TextBuffer>();
+
+function bufferText(
+  ctx: BotContext,
+  chatId: string,
+  text: string,
+  businessConnectionId?: string
+): void {
+  const existing = textBuffers.get(chatId);
+  if (existing) {
+    existing.texts.push(text);
+    existing.ctx = ctx;
+    if (businessConnectionId) existing.businessConnectionId = businessConnectionId;
+    clearTimeout(existing.timer);
+    existing.timer = setTimeout(() => void flushText(chatId), TEXT_DEBOUNCE_MS);
+  } else {
+    textBuffers.set(chatId, {
+      texts: [text],
+      ctx,
+      businessConnectionId,
+      timer: setTimeout(() => void flushText(chatId), TEXT_DEBOUNCE_MS),
+    });
+  }
+}
+
+async function flushText(chatId: string): Promise<void> {
+  const buf = textBuffers.get(chatId);
+  if (!buf) return;
+  textBuffers.delete(chatId);
+  const combined = buf.texts.join("\n").trim();
+  if (!combined) return;
+
+  runSerialized(chatId, async () => {
+    const client = clientsStore.getById(chatId);
+    if (!client) return;
+    await routeText(buf.ctx, client, combined, buf.businessConnectionId);
+  });
+}
+
+// Bufer to'lgach chaqiriladi — ENG YANGI mijoz holati asosida to'g'ri handlerni
+// tanlaydi. USTUVORLIK: mijozning JORIY ehtiyoji har doim so'rovnomadan ustun.
+async function routeText(
+  ctx: BotContext,
+  client: ClientData,
+  text: string,
+  businessConnectionId?: string
+): Promise<void> {
+  const chatId = client.chatId;
+
+  // 1) Faqat raqamdan iborat (uzun) matn — barcode.
+  if (isLikelyBarcodeText(text, client.feedbackStage)) {
+    await guardReply(ctx, client, businessConnectionId, "handleTypedBarcode", text, () =>
+      handleTypedBarcode(ctx, client, text, businessConnectionId)
+    );
+    return;
+  }
+  // 2) Ulanish usuli (qisqa/uzoq) kutilyapti.
+  if (client.awaitingConnectionMethod) {
+    await guardReply(ctx, client, businessConnectionId, "handleConnectionMethodAnswer", text, () =>
+      handleConnectionMethodAnswer(ctx, client, text, businessConnectionId)
+    );
+    return;
+  }
+  // 3) Uzoq masofa yo'riqnomasi davom etyapti (holat mashinasi).
+  if (client.longRangeStage) {
+    await guardReply(ctx, client, businessConnectionId, "handleLongRange", text, () =>
+      handleLongRange(ctx, client, text, businessConnectionId)
+    );
+    return;
+  }
+  // 4) Model nomi kutilyapti.
+  if (client.awaitingModelName) {
+    await guardReply(ctx, client, businessConnectionId, "handleModelNameAnswer", text, () =>
+      handleModelNameAnswer(ctx, client, text, businessConnectionId)
+    );
+    return;
+  }
+  // 5) So'rovnoma davom etyaptimi? (eng past ustuvorlik)
+  if (client.feedbackStage && client.feedbackStage !== "done") {
+    await guardReply(ctx, client, businessConnectionId, "routeDuringFeedback", text, () =>
+      routeDuringFeedback(ctx, client, text, businessConnectionId)
+    );
+    return;
+  }
+  // 6) Oddiy suhbat.
+  await guardReply(ctx, client, businessConnectionId, "handleText", text, () =>
+    handleText(ctx, client, text, businessConnectionId)
+  );
+}
+
 // ─── Dublikat yuborishdan himoya ─────────────────────────────────────────────
 // Bir nechta oqim (rasm buferi, matn oqimi, barcode oqimi) bir-birini bilmay
 // bir xil javobni mustaqil yuborib qo'yishi mumkin. Shu himoya: aynan bir xil
@@ -448,6 +500,16 @@ async function sendGuaranteedFallback(
   text: string,
   businessConnectionId?: string
 ): Promise<void> {
+  // Ketma-ket bir necha marta tushunolmagan bo'lsak — bir xil "tushunmadim"
+  // ni takrorlamaymiz, mijozni operatorga yo'naltiramiz (admin allaqachon
+  // xabardor qilingan).
+  if ((client.unresolvedCount ?? 0) >= 2) {
+    const msg = client.language !== "ru"
+      ? "Kechirasiz, buni to'g'ri hal qilishim uchun hamkasbim tez orada siz bilan bog'lanadi. Biroz kuting, iltimos."
+      : "Извините, чтобы решить это правильно, с вами скоро свяжется наш сотрудник. Немного подождите.";
+    await sendMsg(ctx, client.chatId, msg, businessConnectionId, { allowRepeat: true });
+    return;
+  }
   try {
     const samples = samplesStore.getAll().map((s) => s.text);
     const reply = await answerQuestion({
@@ -460,6 +522,7 @@ async function sendGuaranteedFallback(
       shouldGreet: false,
       history: client.messageHistory || [],
       samples,
+      rephraseHint: (client.unresolvedCount ?? 0) >= 1,
     });
     const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
     if (parts.length > 0) {
@@ -506,12 +569,88 @@ async function guardReply(
   }
   const after = sendCounts.get(chatId) ?? 0;
   if (after === before) {
-    logger.error({ chatId, label, text }, `${label}: mijozga HECH NARSA yuborilmadi — majburiy fallback`);
+    // Handler mijozga hech narsa yubormadi — bu jiddiy holat.
     const fresh = clientsStore.getById(chatId) ?? client;
+    fresh.unresolvedCount = (fresh.unresolvedCount ?? 0) + 1;
+    clientsStore.save(fresh);
+    logger.error(
+      { chatId, label, text, unresolvedCount: fresh.unresolvedCount },
+      `${label}: mijozga HECH NARSA yuborilmadi — majburiy fallback`
+    );
+    if (fresh.unresolvedCount >= 2) {
+      await notifyAdminsClientStuck(ctx, fresh, `Bot ketma-ket javob berolmayapti (${label}).`);
+    }
     await sendGuaranteedFallback(ctx, fresh, text, businessConnectionId);
   } else {
     logger.info({ chatId, label }, `${label}: javob yuborildi`);
+    // Eslatma: tiqilish hisoblagichini (unresolvedCount) BU YERDA tozalamaymiz —
+    // "tushunmadim, qayta so'rayman" kabi yumshoq-nosozlik ham xabar yuboradi,
+    // shuning uchun har qanday yuborishni "muvaffaqiyat" deb hisoblab bo'lmaydi.
+    // Hisoblagich HAQIQIY yordam berilgan joylarda aniq tozalanadi
+    // (resetStuck): handleText javobi, uzoq masofa qadami, model aniqlanishi.
   }
+}
+
+// Haqiqiy yordam berilganda tiqilish hisoblagichini tozalaydi.
+function resetStuck(client: ClientData): void {
+  if (client.unresolvedCount || client.stuckAdminNotified) {
+    client.unresolvedCount = 0;
+    client.stuckAdminNotified = false;
+  }
+}
+
+// ─── Adminni tiqilib qolgan mijoz haqida ogohlantirish ────────────────────────
+
+// Bot mijozga yordam berolmay qolganda adminlarga darhol xabar yuboradi —
+// mijoz ismi, chatId va oxirgi 5 xabar bilan, admin darhol aralasha olsin.
+// Bir mijoz uchun bir tiqilishda faqat bir marta (stuckAdminNotified) yuboramiz.
+async function notifyAdminsClientStuck(
+  ctx: BotContext,
+  client: ClientData,
+  reason: string
+): Promise<void> {
+  if (client.stuckAdminNotified) return;
+  client.stuckAdminNotified = true;
+  clientsStore.save(client);
+
+  const last5 = (client.messageHistory || [])
+    .slice(-5)
+    .map((m) => `${m.role === "user" ? "Mijoz" : "Bot"}: ${m.content}`)
+    .join("\n");
+
+  const text =
+    `⚠️ Mijozga yordam kerak — bot tiqilib qoldi.\n` +
+    `Sabab: ${reason}\n` +
+    `Mijoz: ${client.firstName ?? "(ism yo'q)"}\n` +
+    `chatId: ${client.chatId}\n` +
+    `Model: ${client.lastModelName ?? "(noma'lum)"}\n\n` +
+    `Oxirgi xabarlar:\n${last5 || "(yo'q)"}`;
+
+  for (const adminId of getAdminIds()) {
+    try {
+      await ctx.telegram.sendMessage(adminId, text);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+// Mijoz javobini split qilib yuboradi; bo'sh bo'lsa hech narsa qilmaydi
+// (chaqiruvchi guardReply orqali kafolatlanadi). Yuborilgan matn tarixga
+// yoziladi.
+async function sendReplyParts(
+  ctx: BotContext,
+  client: ClientData,
+  reply: string,
+  businessConnectionId?: string
+): Promise<boolean> {
+  const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
+  if (parts.length === 0) return false;
+  for (const part of parts) {
+    await sendMsg(ctx, client.chatId, part, businessConnectionId);
+    if (parts.length > 1) await sleep(800);
+  }
+  return true;
 }
 
 async function sendVideoMsg(
@@ -650,18 +789,33 @@ async function sendShortRangeGuide(
   clientsStore.save(client);
 }
 
-// Uzoq masofa — video yo'q, AI matnli yo'riqnomaga tayanib savol-javob tarzida yordam beradi.
-// "Ishladimi?" so'rovi va sharh yuborish bosqichi hozircha faqat qisqa masofa uchun ishlaydi.
+// Uzoq masofa — video yo'q, bosqichma-bosqich matnli yordam. Bu yerda holat
+// (longRangeStage) O'RNATILADI — aks holda mijozning javobi umumiy handleText'ga
+// tushib, noto'g'ri tushunilardi (aynan shu bug mijozni yo'qotgan edi).
 async function sendLongRangeIntro(
   ctx: BotContext,
   client: ClientData,
   businessConnectionId?: string
 ): Promise<void> {
   const isUz = client.language !== "ru";
+
+  // Bilim bazasi bo'sh bo'lsa — adminni darhol ogohlantiramiz (bot umumiy
+  // bilim bilan yordam berishga urinadi, lekin admin aniq yo'riqnoma qo'shsin).
+  const model = client.lastModelName ? modelsStore.getByName(client.lastModelName) : undefined;
+  const guideEmpty = !model || model.longRangeGuides.length === 0;
+  if (guideEmpty) {
+    await notifyAdminsClientStuck(
+      ctx,
+      client,
+      `"${client.lastModelName ?? "?"}" uchun UZOQ MASOFA yo'riqnomasi (longRangeGuides) BO'SH. Mijoz uzoq masofa yordam so'rayapti.`
+    );
+  }
+
   const msg = isUz
-    ? "Uzoq masofadan ulash bo'yicha yordam beraman. Kamerangiz ilovada qo'shilganmi, yoki boshidan boshlaylikmi?"
-    : "Помогу подключить камеру на дальнем расстоянии. Камера уже добавлена в приложении, или начнём с начала?";
-  await sendMsg(ctx, client.chatId, msg, businessConnectionId);
+    ? "Uzoq masofadan ulashda yordam beraman. Aytingchi — kamerangiz telefon ilovasiga allaqachon qo'shilganmi, yoki boshidan boshlab qo'shamizmi?"
+    : "Помогу подключить на дальнем расстоянии. Скажите — камера уже добавлена в приложение, или добавим с начала?";
+  client.longRangeStage = "asked_status";
+  await sendMsg(ctx, client.chatId, msg, businessConnectionId, { allowRepeat: true });
   addToHistory(client, "assistant", msg);
   clientsStore.save(client);
 }
@@ -676,6 +830,156 @@ async function deliverConnectionGuide(
   } else {
     await sendLongRangeIntro(ctx, client, businessConnectionId);
   }
+}
+
+// ─── Uzoq masofa holat mashinasi ──────────────────────────────────────────────
+
+// Mijoz muvaffaqiyat/minnatdorchilik bildirsa — uzoq masofani yakunlaymiz.
+// (qisqartma o'zbekchani ham hisobga olamiz)
+const LONG_RANGE_SUCCESS_RE =
+  /(rahmat|raxmat|rahmet|tashakkur|bo'?ldi\b|buldi\b|ishladi|iwladi|zo'?r\b|zur\b|ulandi|ko'?rinyapti|korinyapti|korindi|hammasi joyida)/i;
+
+async function handleLongRange(
+  ctx: BotContext,
+  client: ClientData,
+  text: string,
+  businessConnectionId?: string
+): Promise<void> {
+  if (client.longRangeStage === "asked_status") {
+    await handleLongRangeAnswer(ctx, client, text, businessConnectionId);
+  } else {
+    await handleLongRangeGuiding(ctx, client, text, businessConnectionId);
+  }
+}
+
+// "asked_status" — "ilovada qo'shilganmi/boshidanmi?" javobini SO'RALGAN SAVOL
+// kontekstida tushunamiz (umumiy detectIntent EMAS).
+async function handleLongRangeAnswer(
+  ctx: BotContext,
+  client: ClientData,
+  text: string,
+  businessConnectionId?: string
+): Promise<void> {
+  const kind = await classifyLongRangeAnswer(text);
+  logger.info({ chatId: client.chatId, kind, text }, "long-range: asked_status javobi");
+
+  if (kind === "unclear") {
+    client.unresolvedCount = (client.unresolvedCount ?? 0) + 1;
+    clientsStore.save(client);
+
+    // Ikki marta so'rab ham aniq bo'lmasa — LOOP qilmaymiz: adminni
+    // ogohlantirib, boshidan boshlash bilan bosqichma-bosqich davom etamiz
+    // (AI baribir yordam beradi).
+    if (client.unresolvedCount >= 2) {
+      await notifyAdminsClientStuck(ctx, client, "Uzoq masofa: mijoz 'ilovada qo'shilganmi?' savoliga aniq javob bermadi — boshidan davom etyapmiz.");
+      client.longRangeStage = "guiding";
+      client.unresolvedCount = 0;
+      clientsStore.save(client);
+      addToHistory(client, "user", text);
+      await runLongRangeGuiding(ctx, client, text, true, businessConnectionId);
+      return;
+    }
+
+    // Savolni SODDALASHTIRIB qayta beramiz (bir xil matnni takrorlamaymiz).
+    const q = client.language !== "ru"
+      ? "Sodda qilib so'rayman — ilovaga kamerani qo'shib bo'lganmisiz? \"Ha\" yoki \"yo'q\" deb yozing."
+      : "Спрошу проще — вы уже добавили камеру в приложение? Напишите \"да\" или \"нет\".";
+    addToHistory(client, "user", text);
+    addToHistory(client, "assistant", q);
+    clientsStore.save(client);
+    await sendMsg(ctx, client.chatId, q, businessConnectionId, { allowRepeat: true });
+    return;
+  }
+
+  // Aniq javob keldi — guiding rejimiga o'tamiz va birinchi qadamni beramiz.
+  client.longRangeStage = "guiding";
+  client.unresolvedCount = 0;
+  client.stuckAdminNotified = false;
+  clientsStore.save(client);
+  addToHistory(client, "user", text);
+  await runLongRangeGuiding(ctx, client, text, kind === "start_over", businessConnectionId);
+}
+
+// "guiding" — bosqichma-bosqich yordam.
+async function handleLongRangeGuiding(
+  ctx: BotContext,
+  client: ClientData,
+  text: string,
+  businessConnectionId?: string
+): Promise<void> {
+  // Mijoz ishlaganini/rahmat aytsa — yakunlaymiz.
+  if (LONG_RANGE_SUCCESS_RE.test(text)) {
+    addToHistory(client, "user", text);
+    await finishLongRange(ctx, client, businessConnectionId);
+    return;
+  }
+  addToHistory(client, "user", text);
+  await runLongRangeGuiding(ctx, client, text, false, businessConnectionId);
+}
+
+async function runLongRangeGuiding(
+  ctx: BotContext,
+  client: ClientData,
+  text: string,
+  fromStart: boolean,
+  businessConnectionId?: string
+): Promise<void> {
+  const model = client.lastModelName ? modelsStore.getByName(client.lastModelName) : undefined;
+  const guide = model
+    ? model.longRangeGuides.map((g) => g.text).filter((t) => t.trim()).join("\n\n")
+    : "";
+
+  const reply = await answerLongRangeStep({
+    question: text,
+    language: client.language,
+    modelName: client.lastModelName ?? "",
+    longRangeGuide: guide,
+    history: client.messageHistory || [],
+    fromStart,
+  });
+
+  const sent = await sendReplyParts(ctx, client, reply, businessConnectionId);
+  if (sent) {
+    addToHistory(client, "assistant", reply);
+    client.hasGreeted = true;
+    client.lastInteractionDate = todayStr();
+    client.unresolvedCount = 0;
+    clientsStore.save(client);
+    return;
+  }
+
+  // AI hech narsa qaytarmadi — tiqilish. Adminni ogohlantiramiz, mijozni
+  // HALOL xabardor qilamiz (bir xil "tushunmadim" ni takrorlamaymiz).
+  client.unresolvedCount = (client.unresolvedCount ?? 0) + 1;
+  clientsStore.save(client);
+  await notifyAdminsClientStuck(ctx, client, "Uzoq masofa: bot javob berolmadi (bilim bazasi bo'sh bo'lishi mumkin).");
+  const msg = client.language !== "ru"
+    ? "Bir daqiqa, shu bo'yicha aniq yo'riqnomani tayyorlab, tez orada yuboraman."
+    : "Одну минуту, подготовлю точную инструкцию и скоро пришлю.";
+  await sendMsg(ctx, client.chatId, msg, businessConnectionId, { allowRepeat: true });
+}
+
+async function finishLongRange(
+  ctx: BotContext,
+  client: ClientData,
+  businessConnectionId?: string
+): Promise<void> {
+  client.longRangeStage = undefined;
+  client.awaitingConnectionConfirm = false;
+  client.connectionConfirmed = true;
+  client.gratitudeSent = true;
+  client.unresolvedCount = 0;
+  client.stuckAdminNotified = false;
+  clientsStore.save(client);
+
+  const msg = client.language !== "ru"
+    ? "Zo'r! Endi kamerangizni istalgan joydan ko'ra olasiz. Yana savol bo'lsa, bemalol yozing."
+    : "Отлично! Теперь вы можете смотреть камеру откуда угодно. Будут вопросы — пишите.";
+  await sendMsg(ctx, client.chatId, msg, businessConnectionId, { allowRepeat: true });
+  addToHistory(client, "assistant", msg);
+  clientsStore.save(client);
+
+  if (!client.refundRequested) await sendReview(ctx, client, businessConnectionId);
 }
 
 // Model aniqlanganda mijozga tabiiy tarzda aytamiz — mijoz bot uni tanidimi
@@ -767,6 +1071,7 @@ async function handleConnectionMethodAnswer(
     client.connectionMethod = connectionMethod;
     client.awaitingConnectionMethod = false;
     client.connectionMethodAsks = 0;
+    resetStuck(client);
     clientsStore.save(client);
 
     if (!client.lastModelName) {
@@ -970,6 +1275,7 @@ async function handleModelNameAnswer(
     client.lastModelName = matchedModel.name;
     client.hasGreeted = true;
     client.lastInteractionDate = todayStr();
+    resetStuck(client);
     clientsStore.save(client);
     modelMentionsStore.record(matchedModel.name, client.chatId);
     await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
@@ -1059,6 +1365,7 @@ async function handleTypedBarcode(
     client.lastInteractionDate = todayStr();
     client.barcodeAttempts = 0;
     client.awaitingModelName = false;
+    resetStuck(client);
     clientsStore.save(client);
     modelMentionsStore.record(matched.name, client.chatId);
     await announceModel(ctx, client, matched.name, businessConnectionId);
@@ -1400,6 +1707,7 @@ async function handlePhotos(
       client.hasGreeted = true;
       client.lastInteractionDate = todayStr();
       client.barcodeAttempts = 0;
+      resetStuck(client);
       clientsStore.save(client);
       modelMentionsStore.record(matchedModel.name, client.chatId);
       await announceModel(ctx, client, matchedModel.name, businessConnectionId);
@@ -1502,6 +1810,7 @@ async function handleText(
       addToHistory(client, "assistant", reply);
       client.hasGreeted = true;
       client.lastInteractionDate = todayStr();
+      resetStuck(client);
       clientsStore.save(client);
 
       const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
@@ -1522,6 +1831,7 @@ async function handleText(
       addToHistory(client, "user", text);
       addToHistory(client, "assistant", reply);
       client.lastInteractionDate = todayStr();
+      resetStuck(client);
       clientsStore.save(client);
       await sendMsg(ctx, chatId, reply, businessConnectionId);
     } else {
@@ -1585,6 +1895,7 @@ async function handleText(
   addToHistory(client, "assistant", reply);
   client.hasGreeted = true;
   client.lastInteractionDate = todayStr();
+  resetStuck(client);
   clientsStore.save(client);
 
   const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);

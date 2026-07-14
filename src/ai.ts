@@ -114,6 +114,11 @@ async function callClaude(
   }
 }
 
+// Haqiqiy mijozlar ko'pincha qisqartma o'zbekchada yozadi — buni AI ga har
+// safar eslatamiz, aks holda javoblarni noto'g'ri tushunadi.
+const SHORTHAND_UZ_NOTE =
+  `MUHIM: Mijozlar ko'pincha qisqartma/xato o'zbekchada yozadi — 'sh' o'rniga 'w' (bowidan=boshidan, iwxona=ishxona, tuwunasz=tushunasiz), unlilar tushib qoladi (kop=ko'p, korib=ko'rib), maxsus harflar oddiy yoziladi. Shuni hisobga olib ma'noni to'g'ri tushun.`;
+
 // ─── Rasm tahlili ─────────────────────────────────────────────────────────────
 
 export interface ImageInput {
@@ -205,6 +210,107 @@ Faqat JSON qaytar: {"kind":"survey_answer|other"}`,
     // Tasnif ishlamasa — hozirgi xatti-harakatni saqlaymiz (so'rovnoma davom etadi).
     return "survey_answer";
   }
+}
+
+// ─── Uzoq masofa: "ilovada qo'shilganmi/boshidanmi?" javobini tasniflash ──────
+
+// Mijoz javobini UMUMIY detectIntent bilan emas, aynan SO'RALGAN SAVOL
+// kontekstida tushunamiz — aks holda "ha boshidan" kabi javob "gratitude"
+// deb noto'g'ri tushuniladi.
+export async function classifyLongRangeAnswer(
+  answer: string
+): Promise<"start_over" | "already_added" | "unclear"> {
+  try {
+    const response = await callClaude("classifyLongRangeAnswer", {
+      model: MODEL,
+      max_tokens: 24,
+      messages: [
+        {
+          role: "user",
+          content: `Bot mijozdan so'radi: "Kamerangiz telefon ilovasiga allaqachon qo'shilganmi, yoki boshidan boshlab qo'shamizmi?"
+Mijoz javobi: "${answer}"
+
+${SHORTHAND_UZ_NOTE}
+
+Mijoz nimani nazarda tutyapti?
+- "start_over": boshidan boshlash kerak / hali qo'shilmagan / qo'sha olmadi ("boshidan", "bowidan", "yo'q", "yoq", "qo'sholmadim", "ulab bo'lmadi")
+- "already_added": kamera ilovaga allaqachon qo'shilgan ("ha", "qo'shilgan", "bor", "qo'shdim")
+- "unclear": aniq emas
+
+Faqat JSON: {"kind":"start_over|already_added|unclear"}`,
+        },
+      ],
+    });
+    const block = response.content[0];
+    if (block.type !== "text") return "unclear";
+    const jsonMatch = block.text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return "unclear";
+    const parsed = JSON.parse(jsonMatch[0]) as { kind?: string };
+    if (parsed.kind === "start_over" || parsed.kind === "already_added") return parsed.kind;
+    return "unclear";
+  } catch {
+    return "unclear";
+  }
+}
+
+// ─── Uzoq masofa: bosqichma-bosqich yordam ────────────────────────────────────
+
+export interface LongRangeStepOptions {
+  question: string;                 // mijozning oxirgi xabari
+  language: "uz" | "uz-cyrl" | "ru";
+  modelName: string;
+  longRangeGuide: string;           // admin kiritgan uzoq masofa yo'riqnomasi (bo'sh bo'lishi mumkin)
+  history: MessageRecord[];
+  fromStart: boolean;               // boshidan boshlanyaptimi (true) yoki allaqachon qo'shilgan (false)
+}
+
+// Mijozga uzoq masofa (router orqali) ulashda BITTA qadamni tushuntiradi va
+// mijoz bajarganini so'raydi — butun yo'riqnomani bir yo'la tashlamaydi.
+export async function answerLongRangeStep(opts: LongRangeStepOptions): Promise<string> {
+  const { question, language, modelName, longRangeGuide, history, fromStart } = opts;
+  const isUz = language === "uz" || language === "uz-cyrl";
+
+  const guideBlock = longRangeGuide.trim()
+    ? `Do'kon tayyorlagan uzoq masofa yo'riqnomasi (shunga tayan):\n${longRangeGuide}`
+    : `Bu model uchun maxsus yo'riqnoma hali kiritilmagan — umumiy IP/WiFi kamera bilimingdan foydalanib yordam ber (kamerani uy WiFi routeriga ulash, ilovada qurilma qo'shish, QR/kod orqali).`;
+
+  const systemPrompt = isUz
+    ? `Sen EnvoCam kamera do'konining samimiy yordamchisisan. Mijozga ${modelName} kamerasini UZOQ MASOFADAN (uy WiFi routeri orqali, istalgan joydan ko'rish) ulashda yordam beryapsan.
+
+QOIDALAR:
+- Hech qachon emoji ishlatma. Iliq, sodda, inson kabi gapir.
+- BOSQICHMA-BOSQICH yordam ber: BITTA qadamni ayt, keyin mijoz bajarganini so'ra ("shu bo'ldimi?"). Butun yo'riqnomani bir yo'la TASHLAMA.
+- Har bir javob 1-3 qisqa jumladan oshmasin.
+- ${fromStart ? "Mijoz BOSHIDAN boshlayapti — birinchi qadamdan boshla." : "Mijoz kamerani ilovaga allaqachon qo'shgan — u aynan nimada qiynalayotganini so'ra va o'sha joydan davom et."}
+- Mijoz "bo'ldi/ha" desa — keyingi qadamga o't. Tushunmasa — o'sha qadamni BOSHQACHA, SODDAROQ tushuntir (bir xil so'zni takrorlama).
+- ${SHORTHAND_UZ_NOTE}
+
+${guideBlock}`
+    : `Ты дружелюбный помощник магазина камер EnvoCam. Помогаешь клиенту подключить камеру ${modelName} НА ДАЛЬНЕМ расстоянии (через домашний WiFi роутер).
+
+ПРАВИЛА:
+- Без эмодзи. Тепло, просто, по-человечески.
+- ПОШАГОВО: назови ОДИН шаг, затем спроси, получилось ли. Не выкладывай всю инструкцию сразу.
+- Каждый ответ — 1-3 коротких предложения.
+- ${fromStart ? "Клиент начинает С НАЧАЛА — начни с первого шага." : "Камера уже добавлена — спроси, что именно не получается, и продолжи оттуда."}
+- Если не понял — объясни ИНАЧЕ, ПРОЩЕ (не повторяй те же слова).
+
+${guideBlock}`;
+
+  const historyMessages = history.slice(-16).map((m) => ({
+    role: m.role as "user" | "assistant",
+    content: m.content,
+  }));
+
+  const response = await callClaude("answerLongRange", {
+    model: MODEL,
+    max_tokens: 700,
+    system: systemPrompt,
+    messages: [...historyMessages, { role: "user", content: question }],
+  });
+
+  const block = response.content[0];
+  return block.type === "text" ? block.text : "";
 }
 
 // Mijoz rasm(lar)idan kamera modelini aniqlaydi. ENG ISHONCHLI belgi —
@@ -366,6 +472,8 @@ CONNECTION METHOD — faqat xabarda ANIQ tilga olingan bo'lsa ko'rsat, aks holda
 
 PRODUCT FEEDBACK — agar xabarda kamera haqida shikoyat, istak/xususiyat so'rovi yoki yoqtirish/yoqtirmaslik bo'lsa, buni 2-5 so'zda qisqa ifodada yoz (masalan: "video sifati past", "tungi ko'rish yo'q", "batareya tez tugaydi", "narxi qimmat"). Aks holda null.
 
+${SHORTHAND_UZ_NOTE}
+
 Xabar: "${text}"`,
       },
     ],
@@ -517,6 +625,7 @@ export interface AnswerOptions {
   shouldGreet: boolean;       // bu xabarda salom berish kerakmi
   history: MessageRecord[];   // oldingi xabarlar
   samples: string[];          // namuna yozishmalar
+  rephraseHint?: boolean;     // mijoz oldingi javobni tushunmadi — boshqacha, soddaroq tushuntir
 }
 
 export async function answerQuestion(opts: AnswerOptions): Promise<string> {
@@ -632,9 +741,15 @@ ${samples.length > 0
       ? "\n\n=== Примеры общения (придерживайся этого стиля) ===\n" + samples.join("\n\n---\n\n")
       : ""}`;
 
-  const finalSystemPrompt = language === "uz-cyrl"
+  const rephraseNote = opts.rephraseHint
+    ? (isUz
+      ? `\n\nMUHIM: Mijoz oldingi javobingizni TUSHUNMADI. Ayni shu narsani BOSHQACHA, ANCHA SODDAROQ so'zlar bilan, boshqa misol yoki boshqa yo'l bilan tushuntir. Oldingi javobingdagi bir xil jumlalarni TAKRORLAMA.`
+      : `\n\nВАЖНО: Клиент НЕ ПОНЯЛ предыдущий ответ. Объясни то же самое ИНАЧЕ, гораздо ПРОЩЕ, другими словами. Не повторяй те же фразы.`)
+    : "";
+
+  const finalSystemPrompt = (language === "uz-cyrl"
     ? systemPrompt + `\n\nMUHIM: Mijoz sizga kirill yozuvida yozmoqda. Javobingizni FAQAT kirill yozuvida yozing (lotin emas) — masalan "Assalomu alaykum" emas "Ассалому алайкум", "Rahmat" emas "Раҳмат" deb yozing.`
-    : systemPrompt;
+    : systemPrompt) + `\n\n${SHORTHAND_UZ_NOTE}` + rephraseNote;
 
   // ─ Tarix ─
   const historyMessages = history.slice(-16).map((m) => ({

@@ -174,6 +174,17 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     ];
 
     if (!modelNameArg) {
+      // Har bir model uchun BO'SH kontent kategoriyalarini ko'rsatamiz — admin
+      // qaysi model uchun qanday yo'riqnoma yetishmayotganini darhol ko'rsin.
+      generalLines.push("", "Kontent bo'shliqlari (yetishmayotgan yo'riqnomalar):");
+      for (const m of models) {
+        const gaps: string[] = [];
+        if (m.longRangeGuides.length === 0) gaps.push("uzoq-masofa");
+        if (m.videoGuides.length === 0) gaps.push("video-qisqa");
+        if (m.appScreenshots.length === 0) gaps.push("ilova");
+        if (m.barcodes.length === 0) gaps.push("barcode");
+        generalLines.push(gaps.length === 0 ? `✅ ${m.name} — hammasi bor` : `⚠️ ${m.name} — bo'sh: ${gaps.join(", ")}`);
+      }
       generalLines.push("", "Model haqida batafsil ma'lumot uchun: /diag <model nomi>  (masalan: /diag A9)");
       await ctx.reply(generalLines.join("\n"));
       return;
