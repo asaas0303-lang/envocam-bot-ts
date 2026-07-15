@@ -48,7 +48,10 @@ type AdminState =
   | { step: "awaiting_faq_question"; modelName: string }
   | { step: "awaiting_faq_answer"; modelName: string; question: string }
   | { step: "awaiting_global_faq_question" }
-  | { step: "awaiting_global_faq_answer"; question: string };
+  | { step: "awaiting_global_faq_answer"; question: string }
+  | { step: "awaiting_global_long_range_guide" }
+  | { step: "awaiting_global_reset_instructions" }
+  | { step: "awaiting_global_short_range_video" };
 
 const adminState = new Map<number, AdminState>();
 function getState(uid: number): AdminState { return adminState.get(uid) || { step: "idle" }; }
@@ -151,7 +154,7 @@ async function doTestReset(ctx: BotContext, chatId: string): Promise<void> {
 const ADMIN_HELP_TEXT = [
   "📋 Admin buyruqlari:",
   "",
-  "/panel — asosiy admin panel (model qo'shish/tahrirlash, kontent, namuna rasm, statistika, API balans)",
+  "/panel — asosiy admin panel (model qo'shish/tahrirlash, kontent, namuna rasm, umumiy FAQ, umumiy yo'riqnoma, statistika, API balans)",
   "/version — hozir deploy qilingan commit'ni ko'rsatadi",
   "/diag — barcha modellar va ularning bo'sh kontent kategoriyalari; /diag <model> — shu model bo'yicha batafsil (rasmlar, kollaj) diagnostika",
   "/diagbarcode — bazadagi barcha barcode raqamlarini va to'qnashuvlarni ko'rsatadi",
@@ -777,6 +780,61 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     await showGlobalFaqMenu(ctx, false);
   });
 
+  // ── Umumiy yo'riqnoma (model aniqlanmaganda fallback sifatida ishlatiladi) ──
+  bot.action("admin_gguide_show", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await showGlobalGuideMenu(ctx, false);
+  });
+
+  bot.action("admin_gguide_lr_set", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    setState(ctx.from.id, { step: "awaiting_global_long_range_guide" });
+    await ctx.editMessageText(
+      "Umumiy uzoq masofa (router orqali ulash) yo'riqnomasini matn qilib yozing — bu barcha modellar uchun umumiy, model aniqlanmaganda ishlatiladi:\n(Bekor — /panel)"
+    );
+  });
+
+  bot.action("admin_gguide_lr_clear", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    settingsStore.clearGlobalLongRangeGuide();
+    await showGlobalGuideMenu(ctx, false);
+  });
+
+  bot.action("admin_gguide_reset_set", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    setState(ctx.from.id, { step: "awaiting_global_reset_instructions" });
+    await ctx.editMessageText(
+      "Umumiy reset ko'rsatmasini yozing (masalan: \"Kamera orqasidagi tugmani 5 soniya bosib turing\"):\n(Bekor — /panel)"
+    );
+  });
+
+  bot.action("admin_gguide_reset_clear", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    settingsStore.clearGlobalResetInstructions();
+    await showGlobalGuideMenu(ctx, false);
+  });
+
+  bot.action("admin_gguide_video_set", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    setState(ctx.from.id, { step: "awaiting_global_short_range_video" });
+    await ctx.editMessageText(
+      "Umumiy qisqa masofa ulash videosini yuboring — model aniqlanmaganda shu video yuboriladi:\n(Bekor — /panel)"
+    );
+  });
+
+  bot.action("admin_gguide_video_clear", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    settingsStore.clearGlobalShortRangeVideo();
+    await showGlobalGuideMenu(ctx, false);
+  });
+
   bot.action("admin_back_main", async (ctx) => {
     if (!ctx.from || !isAdmin(ctx.from.id)) return;
     await ctx.answerCbQuery();
@@ -1140,6 +1198,37 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
       return;
     }
 
+    // Umumiy yo'riqnoma — uzoq masofa matni
+    if (state.step === "awaiting_global_long_range_guide" && "text" in msg) {
+      const text = msg.text.trim();
+      if (!text || text.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
+      settingsStore.setGlobalLongRangeGuide(text);
+      clearState(ctx.from.id);
+      await ctx.reply("Saqlandi.");
+      await showGlobalGuideMenu(ctx, true);
+      return;
+    }
+
+    // Umumiy yo'riqnoma — reset ko'rsatmasi
+    if (state.step === "awaiting_global_reset_instructions" && "text" in msg) {
+      const text = msg.text.trim();
+      if (!text || text.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
+      settingsStore.setGlobalResetInstructions(text);
+      clearState(ctx.from.id);
+      await ctx.reply("Saqlandi.");
+      await showGlobalGuideMenu(ctx, true);
+      return;
+    }
+
+    // Umumiy yo'riqnoma — qisqa masofa video
+    if (state.step === "awaiting_global_short_range_video" && "video" in msg && msg.video) {
+      settingsStore.setGlobalShortRangeVideo(msg.video.file_id, msg.caption);
+      clearState(ctx.from.id);
+      await ctx.reply("Video saqlandi.");
+      await showGlobalGuideMenu(ctx, true);
+      return;
+    }
+
     // Kontent qo'shish
     if (state.step === "adding_content") {
       const { modelName, category } = state;
@@ -1364,7 +1453,8 @@ async function showMainMenu(ctx: BotContext): Promise<void> {
      Markup.button.callback("Hammaga xabar", "admin_broadcast")],
     [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples"),
      Markup.button.callback("Namuna rasm (stiker)", "admin_sticker_sample")],
-    [Markup.button.callback(`🌐 Umumiy savol-javoblar (${settingsStore.getGlobalFaqItems().length})`, "admin_gfaq_show")],
+    [Markup.button.callback(`🌐 Umumiy savol-javoblar (${settingsStore.getGlobalFaqItems().length})`, "admin_gfaq_show"),
+     Markup.button.callback("🌐 Umumiy yo'riqnoma", "admin_gguide_show")],
     [Markup.button.callback("Statistika", "admin_stats"),
      Markup.button.callback("API balans", "admin_api_balance")],
   ]));
@@ -1379,7 +1469,8 @@ async function showMainMenuEdit(ctx: BotContext): Promise<void> {
      Markup.button.callback("Hammaga xabar", "admin_broadcast")],
     [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples"),
      Markup.button.callback("Namuna rasm (stiker)", "admin_sticker_sample")],
-    [Markup.button.callback(`🌐 Umumiy savol-javoblar (${settingsStore.getGlobalFaqItems().length})`, "admin_gfaq_show")],
+    [Markup.button.callback(`🌐 Umumiy savol-javoblar (${settingsStore.getGlobalFaqItems().length})`, "admin_gfaq_show"),
+     Markup.button.callback("🌐 Umumiy yo'riqnoma", "admin_gguide_show")],
     [Markup.button.callback("Statistika", "admin_stats"),
      Markup.button.callback("API balans", "admin_api_balance")],
   ]));
@@ -1511,6 +1602,37 @@ async function showGlobalFaqMenu(ctx: BotContext, asNew: boolean): Promise<void>
   const items = settingsStore.getGlobalFaqItems();
   const text = faqListText("Umumiy savol-javoblar (barcha modellarga tegishli)", items);
   const keyboard = buildFaqListKeyboard(items, "admin_gfaq_del_", "admin_gfaq_add", "admin_back_main");
+  if (asNew) {
+    await ctx.reply(text, keyboard);
+  } else {
+    await ctx.editMessageText(text, keyboard);
+  }
+}
+
+// ─── Umumiy yo'riqnoma (model aniqlanmaganda fallback) ────────────────────────
+
+async function showGlobalGuideMenu(ctx: BotContext, asNew: boolean): Promise<void> {
+  const lr = settingsStore.getGlobalLongRangeGuide();
+  const reset = settingsStore.getGlobalResetInstructions();
+  const video = settingsStore.getGlobalShortRangeVideo();
+  const text =
+    `🌐 Umumiy yo'riqnoma\n\n` +
+    `Model ANIQLANMAGANDA (masalan barcode o'qildi-yu bazada topilmadi) ishlatiladi — bu kameralar deyarli bir xil ulanadi, shuning uchun mijoz yordamsiz qolmaydi.\n\n` +
+    `Uzoq masofa (router) matni: ${lr ? "✅ bor" : "❌ yo'q"}\n` +
+    `Qisqa masofa video: ${video ? "✅ bor" : "❌ yo'q"}\n` +
+    `Reset ko'rsatmasi: ${reset ? "✅ bor" : "❌ yo'q"}`;
+
+  const buttons: ReturnType<typeof Markup.button.callback>[][] = [
+    [Markup.button.callback(lr ? "Uzoq masofa matnini almashtirish" : "Uzoq masofa matnini kiritish", "admin_gguide_lr_set")],
+  ];
+  if (lr) buttons.push([Markup.button.callback("Uzoq masofa matnini o'chirish", "admin_gguide_lr_clear")]);
+  buttons.push([Markup.button.callback(video ? "Qisqa masofa videosini almashtirish" : "Qisqa masofa videosini yuklash", "admin_gguide_video_set")]);
+  if (video) buttons.push([Markup.button.callback("Videoni o'chirish", "admin_gguide_video_clear")]);
+  buttons.push([Markup.button.callback(reset ? "Reset ko'rsatmasini almashtirish" : "Reset ko'rsatmasini kiritish", "admin_gguide_reset_set")]);
+  if (reset) buttons.push([Markup.button.callback("Reset ko'rsatmasini o'chirish", "admin_gguide_reset_clear")]);
+  buttons.push([Markup.button.callback("⬅️ Orqaga", "admin_back_main")]);
+
+  const keyboard = Markup.inlineKeyboard(buttons);
   if (asNew) {
     await ctx.reply(text, keyboard);
   } else {

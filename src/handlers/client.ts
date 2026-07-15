@@ -806,10 +806,18 @@ async function sendShortRangeGuide(
     // (tasks.ts → checkConnectionFollowups) 30 daqiqadan keyin, faqat mijoz
     // o'zi yozmagan bo'lsa, so'raydi.
     addToHistory(client, "assistant", firstCaption);
+  } else if (!model && client.unknownModel && settingsStore.getGlobalShortRangeVideo()) {
+    // Model aniq emas (noma'lum barcode) — umumiy (barcha modellarga
+    // tegishli) qisqa masofa videosini fallback sifatida yuboramiz.
+    const globalVideo = settingsStore.getGlobalShortRangeVideo()!;
+    const caption = globalVideo.caption ||
+      (isUz ? "Kamerani ulash bo'yicha umumiy yo'riqnoma." : "Общая инструкция по подключению камеры.");
+    await sendVideoMsg(ctx, chatId, globalVideo.file_id, caption, businessConnectionId);
+    addToHistory(client, "assistant", caption);
   } else {
     const confirmText = isUz
-      ? `${modelName} kamerasi uchun video yo'riqnoma hali yuklanmagan.`
-      : `Видеоруководство для ${modelName} ещё не загружено.`;
+      ? `${modelName ? modelName + " kamerasi" : "Kamera"} uchun video yo'riqnoma hali yuklanmagan, lekin savollaringizga yordam bera olaman.`
+      : `Видеоруководство ещё не загружено, но я могу помочь с вашими вопросами.`;
     await sendMsg(ctx, chatId, confirmText, businessConnectionId);
     addToHistory(client, "assistant", confirmText);
   }
@@ -832,13 +840,17 @@ async function sendLongRangeIntro(
 
   // Bilim bazasi bo'sh bo'lsa — adminni darhol ogohlantiramiz (bot umumiy
   // bilim bilan yordam berishga urinadi, lekin admin aniq yo'riqnoma qo'shsin).
+  // Model-spetsifik yo'riqnoma bo'lmasa ham, UMUMIY (globalLongRangeGuide)
+  // yo'riqnoma bo'lsa — bu "bo'sh" hisoblanmaydi (mijoz baribir yordam oladi).
   const model = client.lastModelName ? modelsStore.getByName(client.lastModelName) : undefined;
-  const guideEmpty = !model || model.longRangeGuides.length === 0;
+  const hasModelGuide = !!model && model.longRangeGuides.length > 0;
+  const hasGlobalGuide = !!settingsStore.getGlobalLongRangeGuide()?.trim();
+  const guideEmpty = !hasModelGuide && !hasGlobalGuide;
   if (guideEmpty) {
     await notifyAdminsClientStuck(
       ctx,
       client,
-      `"${client.lastModelName ?? "?"}" uchun UZOQ MASOFA yo'riqnomasi (longRangeGuides) BO'SH. Mijoz uzoq masofa yordam so'rayapti.`
+      `"${client.lastModelName ?? "?"}" uchun UZOQ MASOFA yo'riqnomasi (model va umumiy) BO'SH. Mijoz uzoq masofa yordam so'rayapti.`
     );
   }
 
@@ -993,9 +1005,19 @@ async function runLongRangeGuiding(
   businessConnectionId?: string
 ): Promise<void> {
   const model = client.lastModelName ? modelsStore.getByName(client.lastModelName) : undefined;
-  const guide = model
+  const modelGuideText = model
     ? model.longRangeGuides.map((g) => g.text).filter((t) => t.trim()).join("\n\n")
     : "";
+  // Model-spetsifik yo'riqnoma yetarli bo'lmasa ham (yoki model umuman
+  // noma'lum bo'lsa), umumiy uzoq masofa va reset ko'rsatmalarini qo'shib
+  // beramiz — bu kameralar deyarli bir xil ulanadi.
+  const globalGuideText = settingsStore.getGlobalLongRangeGuide()?.trim() ?? "";
+  const globalReset = settingsStore.getGlobalResetInstructions()?.trim() ?? "";
+  const guide = [
+    modelGuideText,
+    globalGuideText,
+    globalReset ? `Reset ko'rsatmasi: ${globalReset}` : "",
+  ].filter(Boolean).join("\n\n");
 
   const reply = await answerLongRangeStep({
     question: text,
@@ -1137,7 +1159,10 @@ async function handleConnectCameraRequest(
     return;
   }
 
-  if (!client.lastModelName) {
+  // Model noma'lum bo'lsa ham, agar barcode allaqachon o'qib ko'rilgan-u
+  // topilmagan bo'lsa (unknownModel) — rasm QAYTA so'ramaymiz, umumiy
+  // yo'riqnoma bilan davom etamiz (MUAMMO 1 tuzatildi).
+  if (!client.lastModelName && !client.unknownModel) {
     if (!client.askedForPhotoOnce && shouldAskForPhoto(chatId)) {
       client.askedForPhotoOnce = true;
       clientsStore.save(client);
@@ -1175,7 +1200,7 @@ async function handleConnectionMethodAnswer(
     resetStuck(client);
     clientsStore.save(client);
 
-    if (!client.lastModelName) {
+    if (!client.lastModelName && !client.unknownModel) {
       if (!client.askedForPhotoOnce && shouldAskForPhoto(client.chatId)) {
         client.askedForPhotoOnce = true;
         clientsStore.save(client);
@@ -1250,37 +1275,42 @@ async function notifyAdminsUnknownBarcode(
 }
 
 // Barcode topilgan-u lekin ro'yxatda yo'q bo'lganda ishlatiladi: adminni
-// xabardor qilib, mijozga jim qolmasdan umumiy yordam beradi.
+// xabardor qilib, mijozga jim qolmasdan umumiy yordam beradi. MUHIM: bu
+// mijozning aybi emas (haqiqiy kamera oldi, faqat raqami hali admin panelga
+// kiritilmagan) — shuning uchun bot bu yerda TO'XTAB QOLMAYDI, balki
+// unknownModel=true bilan xuddi model aniqlangandek davom etadi (umumiy
+// yo'riqnoma/video/reset ma'lumotlari fallback sifatida ishlatiladi).
 async function handleUnknownBarcode(
   ctx: BotContext,
   client: ClientData,
   barcode: string,
-  businessConnectionId?: string
+  businessConnectionId?: string,
+  caption?: string
 ): Promise<void> {
-  const chatId = client.chatId;
   await notifyAdminsUnknownBarcode(ctx, barcode, client);
 
-  const samples = samplesStore.getAll().map((s) => s.text);
-  await randomDelay(15000, 50000);
-  const question = `Mijoz kamera qutisidagi barcode raqamini yubordi (rasmdan avtomatik o'qildi): ${barcode}. Bu raqam hozircha bizning ro'yxatda yo'q.`;
-  const reply = await answerQuestion({
-    question,
-    language: client.language,
-    cameraModel: undefined,
-    connectionMethod: client.connectionMethod,
-    refundRequested: client.refundRequested,
-    firstName: client.firstName,
-    shouldGreet: false,
-    history: client.messageHistory || [],
-    samples,
-  });
-
-  addToHistory(client, "assistant", reply);
+  client.unknownModel = true;
   client.hasGreeted = true;
   client.lastInteractionDate = todayStr();
+  client.barcodeAttempts = 0;
   clientsStore.save(client);
 
-  await sendReplyParts(ctx, client, reply, businessConnectionId);
+  const msg = client.language !== "ru"
+    ? "Bu barcode'ni aniq tanimadim, lekin baribir kamerangizni sozlashda yordam bera olaman."
+    : "Не смог точно распознать этот штрихкод, но всё равно помогу настроить камеру.";
+  await sendMsg(ctx, client.chatId, msg, businessConnectionId, { allowRepeat: true });
+  addToHistory(client, "assistant", msg);
+  await sleep(800);
+
+  // Mijoz rasm bilan birga savol/muammo ham yozgan bo'lsa (masalan "Uzoq
+  // masofadan ko'rmoqchiman, WiFi ulanmayapti") — buni tashlab yubormaymiz,
+  // to'liq handleText oqimi orqali (intent, ulanish usuli va h.k.) ishlaymiz.
+  if (caption && caption.trim()) {
+    await handleText(ctx, client, caption.trim(), businessConnectionId);
+    return;
+  }
+
+  await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
 }
 
 function onlyDigits(s: string): string {
@@ -1370,6 +1400,7 @@ async function handleModelNameAnswer(
 
   if (matchedModel) {
     client.lastModelName = matchedModel.name;
+    client.unknownModel = false;
     client.hasGreeted = true;
     client.lastInteractionDate = todayStr();
     resetStuck(client);
@@ -1454,6 +1485,7 @@ async function handleTypedBarcode(
 
   if (matched) {
     client.lastModelName = matched.name;
+    client.unknownModel = false;
     client.hasGreeted = true;
     client.lastInteractionDate = todayStr();
     client.barcodeAttempts = 0;
@@ -1829,6 +1861,7 @@ async function handlePhotos(
       const matchedModel = findModelByDigits(models, outcome.match.value, outcome.match.isPartial);
       if (matchedModel) {
         client.lastModelName = matchedModel.name;
+        client.unknownModel = false;
         client.hasGreeted = true;
         client.lastInteractionDate = todayStr();
         client.barcodeAttempts = 0;
@@ -1848,7 +1881,7 @@ async function handlePhotos(
     if (outcome.bestRead && onlyDigits(outcome.bestRead.value).length >= 8) {
       client.barcodeAttempts = 0;
       clientsStore.save(client);
-      await handleUnknownBarcode(ctx, client, outcome.bestRead.value, businessConnectionId);
+      await handleUnknownBarcode(ctx, client, outcome.bestRead.value, businessConnectionId, caption);
       return;
     }
 
@@ -2081,7 +2114,7 @@ async function handleText(
 
   await sendReplyParts(ctx, client, reply, businessConnectionId, text);
 
-  if (!cameraModel && !client.askedForPhotoOnce && shouldAskForPhoto(chatId)) {
+  if (!cameraModel && !client.unknownModel && !client.askedForPhotoOnce && shouldAskForPhoto(chatId)) {
     client.askedForPhotoOnce = true;
     clientsStore.save(client);
     await sendMsg(ctx, chatId, askForCameraPhotoText(client.language), businessConnectionId);

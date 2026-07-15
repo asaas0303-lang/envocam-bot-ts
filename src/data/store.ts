@@ -157,6 +157,10 @@ export interface ClientData {
   stuckAdminNotified?: boolean;  // shu tiqilish uchun admin allaqachon xabardor qilinganmi
   barcodeAttempts?: number;      // nechta marta "yaqinroq rasm" so'ralgan
   awaitingModelName?: boolean;   // barcode aniqlanmagach, oxirgi chora — model nomini matn bilan so'rash
+  // Barcode o'qildi-yu bazada topilmadi (yoki model umuman aniqlanmadi) —
+  // lekin mijoz YORDAMSIZ qolmasligi kerak. Shu holatda kod umumiy (global)
+  // yo'riqnoma/video/reset ko'rsatmalarini fallback sifatida ishlatadi.
+  unknownModel?: boolean;
   refundRequested?: boolean;
   unsupportedMessageNoted?: boolean;
   lastInteractionDate?: string;
@@ -188,9 +192,19 @@ export interface StickerSample {
   file_id: string;
 }
 
+export interface GlobalVideoGuide {
+  file_id: string;
+  caption?: string;
+}
+
 interface AppSettings {
   stickerSample?: StickerSample; // barcha modellar uchun umumiy — quti stikeri joyini ko'rsatuvchi namuna rasm
   globalFaqItems?: FaqItem[];    // barcha modellarga tegishli umumiy savol-javoblar (FAQ)
+  // "Umumiy yo'riqnoma" — model ANIQLANMAGANDA (masalan noma'lum barcode)
+  // fallback sifatida ishlatiladi, chunki bu kameralar deyarli bir xil ulanadi.
+  globalLongRangeGuide?: string;      // umumiy uzoq masofa (router orqali) ulash yo'riqnomasi
+  globalResetInstructions?: string;   // umumiy reset ko'rsatmasi
+  globalShortRangeVideo?: GlobalVideoGuide; // umumiy qisqa masofa ulash videosi
 }
 
 // Anthropic API'da qolgan kredit balansini o'qish uchun ochiq endpoint yo'q —
@@ -499,6 +513,39 @@ export const settingsStore = {
   deleteGlobalFaqItem(id: string): void {
     if (!db.settings.globalFaqItems) return;
     db.settings.globalFaqItems = db.settings.globalFaqItems.filter((f) => f.id !== id);
+    persist();
+  },
+  getGlobalLongRangeGuide(): string | undefined {
+    return db.settings.globalLongRangeGuide;
+  },
+  setGlobalLongRangeGuide(text: string): void {
+    db.settings.globalLongRangeGuide = text;
+    persist();
+  },
+  clearGlobalLongRangeGuide(): void {
+    db.settings.globalLongRangeGuide = undefined;
+    persist();
+  },
+  getGlobalResetInstructions(): string | undefined {
+    return db.settings.globalResetInstructions;
+  },
+  setGlobalResetInstructions(text: string): void {
+    db.settings.globalResetInstructions = text;
+    persist();
+  },
+  clearGlobalResetInstructions(): void {
+    db.settings.globalResetInstructions = undefined;
+    persist();
+  },
+  getGlobalShortRangeVideo(): GlobalVideoGuide | undefined {
+    return db.settings.globalShortRangeVideo;
+  },
+  setGlobalShortRangeVideo(file_id: string, caption?: string): void {
+    db.settings.globalShortRangeVideo = { file_id, caption };
+    persist();
+  },
+  clearGlobalShortRangeVideo(): void {
+    db.settings.globalShortRangeVideo = undefined;
     persist();
   },
 };

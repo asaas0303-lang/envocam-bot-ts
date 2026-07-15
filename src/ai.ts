@@ -759,6 +759,14 @@ export async function answerQuestion(opts: AnswerOptions): Promise<string> {
       knowledgeBase.push("=== Qo'shimcha izohlar ===\n" + imgCaptions.join("\n"));
   }
 
+  // Umumiy (barcha modellarga tegishli) uzoq masofa/reset ko'rsatmalari —
+  // model aniqlanmagan bo'lsa ham (masalan noma'lum barcode), bu kameralar
+  // deyarli bir xil ulanadi, shuning uchun HAR DOIM kontekstga qo'shiladi.
+  const globalLongRange = settingsStore.getGlobalLongRangeGuide()?.trim();
+  if (globalLongRange) knowledgeBase.push("=== Umumiy uzoq masofa (router orqali) ulash yo'riqnomasi ===\n" + globalLongRange);
+  const globalReset = settingsStore.getGlobalResetInstructions()?.trim();
+  if (globalReset) knowledgeBase.push("=== Umumiy reset ko'rsatmasi ===\n" + globalReset);
+
   const faqBlock = buildFaqBlock(cameraModel?.faqItems);
   if (faqBlock) knowledgeBase.push(faqBlock);
 
