@@ -15,8 +15,10 @@ import {
   usageStore,
   type CameraModel,
   type ClientData,
+  type FaqItem,
 } from "../data/store.js";
 import { isAdmin, downloadFileAsBase64, sleep } from "../helpers.js";
+import { logger } from "../lib/logger.js";
 import { extractTextFromImage, analyzeInsights } from "../ai.js";
 import { COLLAGE_MAX_IMAGES, rebuildModelCollageForDiagnostics } from "../collage.js";
 import { sendReportNow } from "../tasks.js";
@@ -41,7 +43,11 @@ type AdminState =
   | { step: "awaiting_sample_title" }
   | { step: "awaiting_sample_text"; title: string }
   | { step: "awaiting_sticker_sample" }
-  | { step: "awaiting_api_balance" };
+  | { step: "awaiting_api_balance" }
+  | { step: "awaiting_faq_question"; modelName: string }
+  | { step: "awaiting_faq_answer"; modelName: string; question: string }
+  | { step: "awaiting_global_faq_question" }
+  | { step: "awaiting_global_faq_answer"; question: string };
 
 const adminState = new Map<number, AdminState>();
 function getState(uid: number): AdminState { return adminState.get(uid) || { step: "idle" }; }
@@ -677,6 +683,50 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     );
   });
 
+  // ── Model FAQ (savol-javoblar) ──
+  bot.action(/^admin_faq_show_(.+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await showModelFaqMenu(ctx, ctx.match[1], false);
+  });
+
+  bot.action(/^admin_faq_add_(.+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const modelName = ctx.match[1];
+    setState(ctx.from.id, { step: "awaiting_faq_question", modelName });
+    await ctx.editMessageText(`${modelName} — savolni yozing:\n(Bekor — /panel)`);
+  });
+
+  bot.action(/^admin_faq_del_(.+)__([a-f0-9-]+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const modelName = ctx.match[1];
+    modelsStore.deleteFaqItem(modelName, ctx.match[2]);
+    await showModelFaqMenu(ctx, modelName, false);
+  });
+
+  // ── Umumiy FAQ (barcha modellarga tegishli) ──
+  bot.action("admin_gfaq_show", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await showGlobalFaqMenu(ctx, false);
+  });
+
+  bot.action("admin_gfaq_add", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    setState(ctx.from.id, { step: "awaiting_global_faq_question" });
+    await ctx.editMessageText("Savolni yozing:\n(Bekor — /panel)");
+  });
+
+  bot.action(/^admin_gfaq_del_([a-f0-9-]+)$/, async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    settingsStore.deleteGlobalFaqItem(ctx.match[1]);
+    await showGlobalFaqMenu(ctx, false);
+  });
+
   bot.action("admin_back_main", async (ctx) => {
     if (!ctx.from || !isAdmin(ctx.from.id)) return;
     await ctx.answerCbQuery();
@@ -863,12 +913,71 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     const state = getState(ctx.from.id);
     const msg = ctx.message;
 
+    // Admin "bilim bazasida javob yo'q" ogohlantirishiga TO'G'RIDAN-TO'G'RI
+    // REPLY qilsa — javobini bilim bazasiga (model FAQ yoki umumiy FAQ) avtomatik
+    // qo'shamiz va darhol mijozga yuboramiz. Faqat aynan shu formatdagi
+    // (Savol:/chatId: maydonlari bor) xabarga reply qilinganda ishga tushadi —
+    // boshqa har qanday admin reply oddiy holatga (state.step) o'tadi.
+    if ("reply_to_message" in msg && msg.reply_to_message && "text" in msg.reply_to_message && "text" in msg) {
+      const repliedText = msg.reply_to_message.text;
+      const questionMatch = repliedText.match(/Savol:\s*"([\s\S]*?)"/);
+      const chatIdMatch = repliedText.match(/chatId:\s*(\S+)/);
+      const modelMatch = repliedText.match(/Model:\s*(.+)/);
+
+      if (questionMatch && chatIdMatch) {
+        const question = questionMatch[1];
+        const targetChatId = chatIdMatch[1];
+        const modelName = modelMatch ? modelMatch[1].trim() : "";
+        const answer = msg.text.trim();
+
+        if (answer && !answer.startsWith("/")) {
+          let addedTo = "";
+          if (modelName && modelName !== "(noma'lum)") {
+            const item = modelsStore.addFaqItem(modelName, question, answer);
+            if (item) addedTo = modelName;
+          }
+          if (!addedTo) {
+            settingsStore.addGlobalFaqItem(question, answer);
+            addedTo = "umumiy";
+          }
+
+          try {
+            const targetClient = clientsStore.getById(targetChatId);
+            if (targetClient?.businessConnectionId) {
+              await ctx.telegram.sendMessage(targetChatId, answer, {
+                business_connection_id: targetClient.businessConnectionId,
+              } as Parameters<typeof ctx.telegram.sendMessage>[2]);
+            } else {
+              await ctx.telegram.sendMessage(targetChatId, answer);
+            }
+            if (targetClient) {
+              targetClient.messageHistory = [
+                ...(targetClient.messageHistory || []),
+                { role: "assistant" as const, content: answer, timestamp: new Date().toISOString() },
+              ].slice(-20);
+              targetClient.unresolvedCount = 0;
+              targetClient.stuckAdminNotified = false;
+              clientsStore.save(targetClient);
+            }
+            logger.info({ targetChatId, modelName: addedTo }, "admin reply: FAQ qo'shildi va mijozga yuborildi");
+            await ctx.reply(`✅ Bilim bazasiga qo'shildi (${addedTo}) va mijozga yuborildi.`);
+          } catch (err) {
+            logger.error({ err, targetChatId }, "admin reply: mijozga yuborishda xatolik");
+            await ctx.reply(
+              `⚠️ Bilim bazasiga qo'shildi (${addedTo}), lekin mijozga yuborishda xatolik: ${err instanceof Error ? err.message : String(err)}`
+            );
+          }
+          return;
+        }
+      }
+    }
+
     // Model nomi
     if (state.step === "awaiting_model_name" && "text" in msg) {
       const name = msg.text.trim();
       if (!name || name.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
       if (modelsStore.getByName(name)) { await ctx.reply(`"${name}" allaqachon bor. Boshqa nom:`); return; }
-      modelsStore.save({ name, images: [], appScreenshots: [], videoGuides: [], longRangeGuides: [], barcodes: [] });
+      modelsStore.save({ name, images: [], appScreenshots: [], videoGuides: [], longRangeGuides: [], barcodes: [], faqItems: [] });
       clearState(ctx.from.id);
       await ctx.reply(`"${name}" modeli qo'shildi.`);
       await showModelMenuNew(ctx, name);
@@ -936,6 +1045,48 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
       clearState(ctx.from.id);
       await ctx.reply(`Balans saqlandi: $${amount.toFixed(2)}`);
       await showApiBalanceMenu(ctx, true);
+      return;
+    }
+
+    // Model FAQ — savol
+    if (state.step === "awaiting_faq_question" && "text" in msg) {
+      const question = msg.text.trim();
+      if (!question || question.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
+      setState(ctx.from.id, { step: "awaiting_faq_answer", modelName: state.modelName, question });
+      await ctx.reply("Endi shu savolning javobini yozing:");
+      return;
+    }
+
+    // Model FAQ — javob
+    if (state.step === "awaiting_faq_answer" && "text" in msg) {
+      const answer = msg.text.trim();
+      if (!answer || answer.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
+      const { modelName, question } = state;
+      modelsStore.addFaqItem(modelName, question, answer);
+      clearState(ctx.from.id);
+      const model = modelsStore.getByName(modelName);
+      await ctx.reply(`Saqlandi. Jami: ${model?.faqItems.length ?? 0} ta savol-javob.`);
+      await showModelFaqMenu(ctx, modelName, true);
+      return;
+    }
+
+    // Umumiy FAQ — savol
+    if (state.step === "awaiting_global_faq_question" && "text" in msg) {
+      const question = msg.text.trim();
+      if (!question || question.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
+      setState(ctx.from.id, { step: "awaiting_global_faq_answer", question });
+      await ctx.reply("Endi shu savolning javobini yozing:");
+      return;
+    }
+
+    // Umumiy FAQ — javob
+    if (state.step === "awaiting_global_faq_answer" && "text" in msg) {
+      const answer = msg.text.trim();
+      if (!answer || answer.startsWith("/")) { clearState(ctx.from.id); await showMainMenu(ctx); return; }
+      settingsStore.addGlobalFaqItem(state.question, answer);
+      clearState(ctx.from.id);
+      await ctx.reply(`Saqlandi. Jami: ${settingsStore.getGlobalFaqItems().length} ta umumiy savol-javob.`);
+      await showGlobalFaqMenu(ctx, true);
       return;
     }
 
@@ -1163,6 +1314,7 @@ async function showMainMenu(ctx: BotContext): Promise<void> {
      Markup.button.callback("Hammaga xabar", "admin_broadcast")],
     [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples"),
      Markup.button.callback("Namuna rasm (stiker)", "admin_sticker_sample")],
+    [Markup.button.callback(`🌐 Umumiy savol-javoblar (${settingsStore.getGlobalFaqItems().length})`, "admin_gfaq_show")],
     [Markup.button.callback("Statistika", "admin_stats"),
      Markup.button.callback("API balans", "admin_api_balance")],
   ]));
@@ -1177,6 +1329,7 @@ async function showMainMenuEdit(ctx: BotContext): Promise<void> {
      Markup.button.callback("Hammaga xabar", "admin_broadcast")],
     [Markup.button.callback(`Namuna yozishmalar (${samplesStore.count()})`, "admin_samples"),
      Markup.button.callback("Namuna rasm (stiker)", "admin_sticker_sample")],
+    [Markup.button.callback(`🌐 Umumiy savol-javoblar (${settingsStore.getGlobalFaqItems().length})`, "admin_gfaq_show")],
     [Markup.button.callback("Statistika", "admin_stats"),
      Markup.button.callback("API balans", "admin_api_balance")],
   ]));
@@ -1189,6 +1342,7 @@ function buildModelKeyboard(modelName: string) {
   const rvid = model?.reviewVideoFileId ? "bor" : "yo'q";
   return Markup.inlineKeyboard([
     [Markup.button.callback(`🔑 Barcode raqamlari (${c("barcodes")})`, `admin_cat_${modelName}__barcodes`)],
+    [Markup.button.callback(`❓ Savol-javoblar (FAQ) (${model?.faqItems.length ?? 0})`, `admin_faq_show_${modelName}`)],
     [Markup.button.callback(`Rasmlar (${c("images")})`, `admin_cat_${modelName}__images`),
      Markup.button.callback(`Yo'riqnoma-uzoq (${c("manual")})`, `admin_cat_${modelName}__manual`)],
     [Markup.button.callback(`Ilova (${c("app")})`, `admin_cat_${modelName}__app`),
@@ -1261,6 +1415,52 @@ async function showApiBalanceMenu(ctx: BotContext, asNew: boolean): Promise<void
     [Markup.button.callback("⬅️ Orqaga", "admin_back_main")],
   ];
   const keyboard = Markup.inlineKeyboard(buttons);
+  if (asNew) {
+    await ctx.reply(text, keyboard);
+  } else {
+    await ctx.editMessageText(text, keyboard);
+  }
+}
+
+// ─── Model FAQ (savol-javoblar) ────────────────────────────────────────────────
+
+function buildFaqListKeyboard(
+  items: FaqItem[],
+  delPrefix: string,
+  addAction: string,
+  backAction: string
+) {
+  const buttons: ReturnType<typeof Markup.button.callback>[][] = items.map((f) => [
+    Markup.button.callback(short(f.question, 30), "admin_noop"),
+    Markup.button.callback("O'chirish", `${delPrefix}${f.id}`),
+  ]);
+  buttons.push([Markup.button.callback("➕ Yangi qo'shish", addAction)]);
+  buttons.push([Markup.button.callback("⬅️ Orqaga", backAction)]);
+  return Markup.inlineKeyboard(buttons);
+}
+
+function faqListText(title: string, items: FaqItem[]): string {
+  if (items.length === 0) return `${title}\n\nHali savol-javob yo'q.`;
+  const lines = items.map((f, i) => `${i + 1}. ${short(f.question, 40)}\n   → ${short(f.answer, 70)}`);
+  return `${title}:\n\n${lines.join("\n\n")}`;
+}
+
+async function showModelFaqMenu(ctx: BotContext, modelName: string, asNew: boolean): Promise<void> {
+  const model = modelsStore.getByName(modelName);
+  const items = model?.faqItems ?? [];
+  const text = faqListText(`${modelName} — Savol-javoblar (FAQ)`, items);
+  const keyboard = buildFaqListKeyboard(items, `admin_faq_del_${modelName}__`, `admin_faq_add_${modelName}`, `admin_model_${modelName}`);
+  if (asNew) {
+    await ctx.reply(text, keyboard);
+  } else {
+    await ctx.editMessageText(text, keyboard);
+  }
+}
+
+async function showGlobalFaqMenu(ctx: BotContext, asNew: boolean): Promise<void> {
+  const items = settingsStore.getGlobalFaqItems();
+  const text = faqListText("Umumiy savol-javoblar (barcha modellarga tegishli)", items);
+  const keyboard = buildFaqListKeyboard(items, "admin_gfaq_del_", "admin_gfaq_add", "admin_back_main");
   if (asNew) {
     await ctx.reply(text, keyboard);
   } else {

@@ -34,6 +34,12 @@ export interface RefCollageMeta {
   generatedAt: string;
 }
 
+export interface FaqItem {
+  id: string;
+  question: string;
+  answer: string;
+}
+
 export interface CameraModel {
   name: string;
   images: ImageItem[];
@@ -44,6 +50,7 @@ export interface CameraModel {
   reviewVideoFileId?: string;
   refCollage?: RefCollageMeta;      // "Rasmlar" kategoriyasidan yasalgan taqqoslash kollaji (keshlangan)
   barcodes: string[];               // Quti stikeridagi barcode raqam(lar)i — modelni ANIQ aniqlaydigan yagona belgi
+  faqItems: FaqItem[];              // Shu modelga xos savol-javoblar (FAQ) — AI bilim bazasiga qo'shiladi
 }
 
 // O'zbekistonning 14 hududi: 12 viloyat + Toshkent shahri (alohida) + Qoraqalpog'iston Respublikasi
@@ -183,6 +190,7 @@ export interface StickerSample {
 
 interface AppSettings {
   stickerSample?: StickerSample; // barcha modellar uchun umumiy — quti stikeri joyini ko'rsatuvchi namuna rasm
+  globalFaqItems?: FaqItem[];    // barcha modellarga tegishli umumiy savol-javoblar (FAQ)
 }
 
 // Anthropic API'da qolgan kredit balansini o'qish uchun ochiq endpoint yo'q —
@@ -254,6 +262,7 @@ function loadDb(): DbShape {
           ...m,
           longRangeGuides: m.longRangeGuides ?? [],
           barcodes: m.barcodes ?? [],
+          faqItems: m.faqItems ?? [],
         })),
         clients: parsed.clients ?? [],
         samples: parsed.samples ?? [],
@@ -294,6 +303,20 @@ export const modelsStore = {
   },
   delete(name: string): void {
     db.models = db.models.filter((m) => m.name !== name);
+    persist();
+  },
+  addFaqItem(modelName: string, question: string, answer: string): FaqItem | undefined {
+    const model = db.models.find((m) => m.name === modelName);
+    if (!model) return undefined;
+    const item: FaqItem = { id: randomUUID(), question, answer };
+    model.faqItems.push(item);
+    persist();
+    return item;
+  },
+  deleteFaqItem(modelName: string, id: string): void {
+    const model = db.models.find((m) => m.name === modelName);
+    if (!model) return;
+    model.faqItems = model.faqItems.filter((f) => f.id !== id);
     persist();
   },
 };
@@ -446,6 +469,21 @@ export const settingsStore = {
   },
   clearStickerSample(): void {
     db.settings.stickerSample = undefined;
+    persist();
+  },
+  getGlobalFaqItems(): FaqItem[] {
+    return db.settings.globalFaqItems ?? [];
+  },
+  addGlobalFaqItem(question: string, answer: string): FaqItem {
+    if (!db.settings.globalFaqItems) db.settings.globalFaqItems = [];
+    const item: FaqItem = { id: randomUUID(), question, answer };
+    db.settings.globalFaqItems.push(item);
+    persist();
+    return item;
+  },
+  deleteGlobalFaqItem(id: string): void {
+    if (!db.settings.globalFaqItems) return;
+    db.settings.globalFaqItems = db.settings.globalFaqItems.filter((f) => f.id !== id);
     persist();
   },
 };

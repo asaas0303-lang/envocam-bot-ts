@@ -2,9 +2,11 @@ import Anthropic from "@anthropic-ai/sdk";
 import {
   REGIONS,
   usageStore,
+  settingsStore,
   type AiFunctionName,
   type CameraModel,
   type ClientFeedback,
+  type FaqItem,
   type MessageRecord,
   type Region,
 } from "./data/store.js";
@@ -350,6 +352,7 @@ export interface LongRangeStepOptions {
   language: "uz" | "uz-cyrl" | "ru";
   modelName: string;
   longRangeGuide: string;           // admin kiritgan uzoq masofa yo'riqnomasi (bo'sh bo'lishi mumkin)
+  modelFaqItems?: FaqItem[];        // shu modelga xos savol-javoblar
   history: MessageRecord[];
   fromStart: boolean;               // boshidan boshlanyaptimi (true) yoki allaqachon qo'shilgan (false)
 }
@@ -357,12 +360,15 @@ export interface LongRangeStepOptions {
 // Mijozga uzoq masofa (router orqali) ulashda BITTA qadamni tushuntiradi va
 // mijoz bajarganini so'raydi — butun yo'riqnomani bir yo'la tashlamaydi.
 export async function answerLongRangeStep(opts: LongRangeStepOptions): Promise<string> {
-  const { question, language, modelName, longRangeGuide, history, fromStart } = opts;
+  const { question, language, modelName, longRangeGuide, modelFaqItems, history, fromStart } = opts;
   const isUz = language === "uz" || language === "uz-cyrl";
 
-  const guideBlock = longRangeGuide.trim()
-    ? `Do'kon tayyorlagan uzoq masofa yo'riqnomasi (shunga tayan):\n${longRangeGuide}`
-    : `Bu model uchun maxsus yo'riqnoma hali kiritilmagan — umumiy IP/WiFi kamera bilimingdan foydalanib yordam ber (kamerani uy WiFi routeriga ulash, ilovada qurilma qo'shish, QR/kod orqali).`;
+  const faqBlock = buildFaqBlock(modelFaqItems);
+  const guideBlock =
+    (longRangeGuide.trim()
+      ? `Do'kon tayyorlagan uzoq masofa yo'riqnomasi (shunga tayan):\n${longRangeGuide}`
+      : `Bu model uchun maxsus yo'riqnoma hali kiritilmagan — umumiy IP/WiFi kamera bilimingdan foydalanib yordam ber (kamerani uy WiFi routeriga ulash, ilovada qurilma qo'shish, QR/kod orqali).`) +
+    (faqBlock ? `\n\n${faqBlock}` : "");
 
   const systemPrompt = isUz
     ? `Sen EnvoCam kamera do'konining samimiy yordamchisisan. Mijozga ${modelName} kamerasini UZOQ MASOFADAN (uy WiFi routeri orqali, istalgan joydan ko'rish) ulashda yordam beryapsan.
@@ -697,6 +703,16 @@ export async function extractTextFromImage(
   return extractText(response);
 }
 
+// Model FAQ + umumiy (barcha modellarga tegishli) FAQ'ni birlashtirib,
+// AI bilim bazasiga qo'shiladigan matn blokini quradi. AI bu ro'yxatdan
+// FOYDALANIB o'z so'zi bilan javob berishi kerak (so'zma-so'z ko'chirmasin).
+function buildFaqBlock(modelFaqItems: FaqItem[] | undefined): string {
+  const items = [...(modelFaqItems ?? []), ...settingsStore.getGlobalFaqItems()];
+  if (items.length === 0) return "";
+  const text = items.map((f) => `S: ${f.question}\nJ: ${f.answer}`).join("\n\n");
+  return "=== Savol-javoblar (FAQ) — mijoz so'zma-so'z shunday yozmasligi mumkin, ma'nosiga qarab mosla ===\n" + text;
+}
+
 // ─── Savollarga javob ─────────────────────────────────────────────────────────
 
 export interface AnswerOptions {
@@ -742,6 +758,9 @@ export async function answerQuestion(opts: AnswerOptions): Promise<string> {
     if (imgCaptions.length > 0)
       knowledgeBase.push("=== Qo'shimcha izohlar ===\n" + imgCaptions.join("\n"));
   }
+
+  const faqBlock = buildFaqBlock(cameraModel?.faqItems);
+  if (faqBlock) knowledgeBase.push(faqBlock);
 
   const isUz = language === "uz" || language === "uz-cyrl";
 

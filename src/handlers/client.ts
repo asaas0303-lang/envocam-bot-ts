@@ -639,11 +639,11 @@ async function notifyAdminsNoAnswer(
 
   const text =
     `⚠️ Mijoz savol berdi, lekin bilim bazasida javob yo'q:\n` +
-    `Savol: "${question.trim().slice(0, 300)}"\n` +
+    `Savol: "${question.trim().slice(0, 300).replace(/"/g, "'")}"\n` +
     `Mijoz: ${client.firstName ?? "(ism yo'q)"}\n` +
     `chatId: ${client.chatId}\n` +
     `Model: ${client.lastModelName ?? "(noma'lum)"}\n\n` +
-    `Bu savolga javobni /panel orqali bilim bazasiga qo'shing.`;
+    `Javob berish uchun SHU XABARGA REPLY qilib yozing — bot avtomatik bilim bazasiga qo'shadi va mijozga yuboradi. (yoki /panel orqali qo'lda qo'shing)`;
 
   for (const adminId of getAdminIds()) {
     try {
@@ -1001,6 +1001,7 @@ async function runLongRangeGuiding(
     language: client.language,
     modelName: client.lastModelName ?? "",
     longRangeGuide: guide,
+    modelFaqItems: model?.faqItems,
     history: client.messageHistory || [],
     fromStart,
   });
