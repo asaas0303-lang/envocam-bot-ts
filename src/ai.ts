@@ -502,11 +502,13 @@ export async function detectIntent(text: string): Promise<IntentResult> {
 
 INTENT (bittasini tanla):
 - greeting: salom, assalomu alaykum, hi, hello, privjet, zdravstvujte
-- gratitude: rahmat, xo'p, ok, yaxshi, bo'ldi, ishladi, uladim, barakalla, zo'r, spasibo
+- gratitude: FAQAT aniq minnatdorchilik so'zlari — "rahmat", "tashakkur", "raxmat", "barakalla", "spasibo". BOSHQA HECH NARSA.
 - cannot_send_photo: rasm yubora olmayotganini aytmoqda
 - connect_camera: kamerani ulash/sozlashda yordam so'ramoqda (masalan: "kamerani qanday ulashman", "ulashga yordam bering", "sozlab bera olasizmi")
 - refund_request: pulini yoki mahsulotni qaytarib berishni so'ramoqda (masalan: "pulimni qaytaring", "mahsulotni qaytarmoqchiman", "refund", "vozvrat")
 - question: yuqoridagilarga to'g'ri kelmaydigan boshqa har qanday savol yoki muammo
+
+MUHIM: "Ha", "Yo'q", "Bo'ldi", "OK", "Xo'p", "Ishladi", "Uladim", "Zo'r", "Yaxshi" kabi QISQA TASDIQ/RAD javoblari MINNATDORCHILIK EMAS — ular oldingi savolga javob. Bularni "question" deb belgila (kontekstda tushuniladi). Minnatdorchilik faqat "rahmat/tashakkur/spasibo" so'zlari bilan bo'ladi.
 
 CONNECTION METHOD — faqat xabarda ANIQ tilga olingan bo'lsa ko'rsat, aks holda null:
 - "short": qisqa masofa, kamera WiFi'siga to'g'ridan-to'g'ri ulanish, yaqin masofadan
@@ -785,9 +787,28 @@ ${samples.length > 0
       : `\n\nВАЖНО: Клиент НЕ ПОНЯЛ предыдущий ответ. Объясни то же самое ИНАЧЕ, гораздо ПРОЩЕ, другими словами. Не повторяй те же фразы.`)
     : "";
 
+  // Mavjud kontent — AI "yo'q" deb yolg'on aytmasligi uchun (masalan video BOR).
+  let contentNote = "";
+  if (cameraModel) {
+    const avail: string[] = [];
+    if (cameraModel.videoGuides.length > 0) avail.push(isUz ? "qisqa masofa uchun VIDEO qo'llanma (bot avtomatik yuboradi)" : "ВИДЕО-инструкция для близкого подключения (бот отправляет автоматически)");
+    if (cameraModel.longRangeGuides.length > 0) avail.push(isUz ? "uzoq masofa uchun matnli yo'riqnoma" : "текстовая инструкция для дальнего подключения");
+    if (cameraModel.appScreenshots.length > 0) avail.push(isUz ? "ilova sozlamalari ma'lumoti" : "данные о настройках приложения");
+    if (avail.length > 0) {
+      contentNote = isUz
+        ? `\n\nBu model uchun MAVJUD kontent: ${avail.join("; ")}. Mijoz shulardan birini (yoki videoni) so'rasa — "yo'q" DEB AYTMA, "bor, hozir yuboraman" deb ayt.`
+        : `\n\nДоступный контент для этой модели: ${avail.join("; ")}. Если клиент просит что-то из этого (или видео) — НЕ говори "нет", скажи "есть, сейчас пришлю".`;
+    }
+  }
+
+  // Do'kon o'zligi + haydab yubormaslik + bilim yo'q bo'lsa [NEED_ADMIN] belgisi.
+  const storeRules = isUz
+    ? `\n\nMUHIM QOIDALAR:\n- Sen EnvoCam kamera do'konining RASMIY yordamchisisan — SEN O'ZING do'konsan.\n- HECH QACHON mijozni "do'konga murojaat qiling", "sotuvchidan so'rang", "texnik xizmatga murojaat qiling" yoki boshqa joyga yuborma. Bu QAT'IY TAQIQLANGAN.\n- Javobni ANIQ bilmasang (ma'lumot bazangda yo'q bo'lsa) — iliq ayt: "Buni aniqlab, sizga tez orada javob beraman", va butun javobingni AYNAN shu belgi bilan boshla: [NEED_ADMIN] (bu belgi mijozga ko'rsatilmaydi, admin xabardor bo'lishi uchun).`
+    : `\n\nВАЖНЫЕ ПРАВИЛА:\n- Ты ОФИЦИАЛЬНЫЙ помощник магазина камер EnvoCam — ты САМ и есть магазин.\n- НИКОГДА не отправляй клиента "обратитесь в магазин", "спросите у продавца", "в техподдержку" и т.п. Это СТРОГО запрещено.\n- Если точного ответа не знаешь (нет в базе) — тепло скажи: "Уточню и скоро вам отвечу" и начни весь ответ РОВНО с метки [NEED_ADMIN] (она не видна клиенту, для уведомления администратора).`;
+
   const finalSystemPrompt = (language === "uz-cyrl"
     ? systemPrompt + `\n\nMUHIM: Mijoz sizga kirill yozuvida yozmoqda. Javobingizni FAQAT kirill yozuvida yozing (lotin emas) — masalan "Assalomu alaykum" emas "Ассалому алайкум", "Rahmat" emas "Раҳмат" deb yozing.`
-    : systemPrompt) + `\n\n${SHORTHAND_UZ_NOTE}` + rephraseNote;
+    : systemPrompt) + `\n\n${SHORTHAND_UZ_NOTE}` + contentNote + storeRules + rephraseNote;
 
   const response = await callClaude("answerQuestion", {
     model: MODEL,

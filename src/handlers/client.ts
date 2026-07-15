@@ -159,19 +159,18 @@ async function processIncomingMessage(
   if (msg.photo) {
     const photos = msg.photo as Array<{ file_id: string }>;
     const caption = typeof msg.caption === "string" ? msg.caption : undefined;
-    // Rasm kelgan vaqtni belgilaymiz — matn oqimi "rasm yuboring" deb
-    // so'ramasligi uchun (poyga holati: matn va rasm oqimlari bir-birini bilmaydi).
+    // Rasm kelgan vaqtni belgilaymiz — "rasm yuboring" deb qayta so'ramaslik uchun.
     lastPhotoAtMap.set(chatId, Date.now());
-    bufferPhoto(ctx, chatId, photos[photos.length - 1].file_id, businessConnectionId, caption);
+    // Rasm ham, u bilan kelgan izoh ham BITTA kirish buferiga tushadi.
+    bufferInput(ctx, chatId, { fileId: photos[photos.length - 1].file_id, text: caption }, businessConnectionId);
     return;
   }
   if (msg.text) {
     const text = msg.text as string;
-    // Matn xabarlarini qisqa bufer bilan yig'amiz — mijoz ketma-ket bir necha
-    // qisqa xabar yozsa (masalan "yoq", "bowidan", "boshidan"), ularni
-    // BIRLASHTIRIB bitta kontekst sifatida ishlaymiz va BITTA javob beramiz.
-    // Yo'naltirish (routeText) bufer to'lgach, ENG YANGI holat bilan bajariladi.
-    bufferText(ctx, chatId, text, businessConnectionId);
+    // Matn ham rasm bilan BIR xil buferga tushadi — rasm+matn birlashtirilib,
+    // BITTA javob beriladi. Bufer to'lgach yo'naltirish ENG YANGI holat bilan
+    // bajariladi.
+    bufferInput(ctx, chatId, { text }, businessConnectionId);
     return;
   }
 
@@ -250,20 +249,23 @@ export function registerClientHandlers(bot: Telegraf<BotContext>): void {
   });
 }
 
-// ─── Rasm bufferi (albom / ketma-ket rasmlar) ─────────────────────────────────
+// ─── Kirish bufferi (rasm + matn bitta oynada birlashtiriladi) ────────────────
+// XATO 6: mijoz rasm va matnni ketma-ket yuborsa (masalan rasm + "ishlamayapti"),
+// ularni BITTA kontekst sifatida birlashtirib, BITTA javob beramiz. Aks holda
+// har biriga alohida, bir-biriga zid javoblar ketardi.
 
-const PHOTO_DEBOUNCE_MS = 3000;
+const INPUT_DEBOUNCE_MS = 6000;
 const MAX_CLIENT_PHOTOS = 5;
 
-interface PhotoBuffer {
+interface InputBuffer {
   fileIds: string[];
+  texts: string[];
   timer: ReturnType<typeof setTimeout>;
   ctx: BotContext;
   businessConnectionId?: string;
-  caption?: string;
 }
 
-const photoBuffers = new Map<string, PhotoBuffer>();
+const inputBuffers = new Map<string, InputBuffer>();
 
 // Mijoz oxirgi marta qachon rasm yuborgani (poyga holatini oldini olish uchun).
 const lastPhotoAtMap = new Map<string, number>();
@@ -272,102 +274,52 @@ const lastPhotoAtMap = new Map<string, number>();
 // (oxirgi 60 soniyada) yoki rasm hozir buferda/navbatda ishlanayotgan bo'lsa,
 // "rasm yuboring" deb so'ramaymiz (absurd bo'lardi).
 function shouldAskForPhoto(chatId: string): boolean {
-  if (photoBuffers.has(chatId)) return false;
+  const buf = inputBuffers.get(chatId);
+  if (buf && buf.fileIds.length > 0) return false;
   const last = lastPhotoAtMap.get(chatId);
   if (last && Date.now() - last < 60_000) return false;
   return true;
 }
 
-function bufferPhoto(
+function bufferInput(
   ctx: BotContext,
   chatId: string,
-  fileId: string,
-  businessConnectionId?: string,
-  caption?: string
-): void {
-  const existing = photoBuffers.get(chatId);
-  if (existing) {
-    if (existing.fileIds.length < MAX_CLIENT_PHOTOS) existing.fileIds.push(fileId);
-    existing.ctx = ctx;
-    if (caption && !existing.caption) existing.caption = caption;
-    clearTimeout(existing.timer);
-    existing.timer = setTimeout(() => void flushPhotos(chatId), PHOTO_DEBOUNCE_MS);
-  } else {
-    photoBuffers.set(chatId, {
-      fileIds: [fileId],
-      ctx,
-      businessConnectionId,
-      caption,
-      timer: setTimeout(() => void flushPhotos(chatId), PHOTO_DEBOUNCE_MS),
-    });
-  }
-}
-
-async function flushPhotos(chatId: string): Promise<void> {
-  const buf = photoBuffers.get(chatId);
-  if (!buf) return;
-  photoBuffers.delete(chatId);
-
-  // Rasmni qayta ishlashni ham shu mijozning navbatiga qo'yamiz — aks holda
-  // mijoz debounce oynasidan tashqarida bir necha rasm yuborsa, bir nechta
-  // handlePhotos parallel ishlab, bir xil javobni takror yuborishi mumkin edi.
-  // guardReply mijoz rasmga ham javobsiz qolmasligini kafolatlaydi.
-  runSerialized(chatId, async () => {
-    const client = clientsStore.getById(chatId);
-    if (!client) return;
-    await guardReply(buf.ctx, client, buf.businessConnectionId, "handlePhotos", buf.caption ?? "(rasm)", () =>
-      handlePhotos(buf.ctx, client, buf.fileIds, buf.businessConnectionId, buf.caption)
-    );
-  });
-}
-
-// ─── Matn bufferi (ketma-ket kelgan qisqa xabarlar) ───────────────────────────
-
-const TEXT_DEBOUNCE_MS = 6000;
-
-interface TextBuffer {
-  texts: string[];
-  timer: ReturnType<typeof setTimeout>;
-  ctx: BotContext;
-  businessConnectionId?: string;
-}
-
-const textBuffers = new Map<string, TextBuffer>();
-
-function bufferText(
-  ctx: BotContext,
-  chatId: string,
-  text: string,
+  item: { fileId?: string; text?: string },
   businessConnectionId?: string
 ): void {
-  const existing = textBuffers.get(chatId);
-  if (existing) {
-    existing.texts.push(text);
-    existing.ctx = ctx;
-    if (businessConnectionId) existing.businessConnectionId = businessConnectionId;
-    clearTimeout(existing.timer);
-    existing.timer = setTimeout(() => void flushText(chatId), TEXT_DEBOUNCE_MS);
-  } else {
-    textBuffers.set(chatId, {
-      texts: [text],
-      ctx,
-      businessConnectionId,
-      timer: setTimeout(() => void flushText(chatId), TEXT_DEBOUNCE_MS),
-    });
+  let buf = inputBuffers.get(chatId);
+  if (!buf) {
+    buf = { fileIds: [], texts: [], ctx, businessConnectionId, timer: setTimeout(() => void flushInput(chatId), INPUT_DEBOUNCE_MS) };
+    inputBuffers.set(chatId, buf);
   }
+  buf.ctx = ctx;
+  if (businessConnectionId) buf.businessConnectionId = businessConnectionId;
+  if (item.fileId && buf.fileIds.length < MAX_CLIENT_PHOTOS) buf.fileIds.push(item.fileId);
+  if (item.text && item.text.trim()) buf.texts.push(item.text.trim());
+  clearTimeout(buf.timer);
+  buf.timer = setTimeout(() => void flushInput(chatId), INPUT_DEBOUNCE_MS);
 }
 
-async function flushText(chatId: string): Promise<void> {
-  const buf = textBuffers.get(chatId);
+async function flushInput(chatId: string): Promise<void> {
+  const buf = inputBuffers.get(chatId);
   if (!buf) return;
-  textBuffers.delete(chatId);
-  const combined = buf.texts.join("\n").trim();
-  if (!combined) return;
+  inputBuffers.delete(chatId);
+  const combinedText = buf.texts.join("\n").trim();
 
+  // Qayta ishlashni shu mijozning navbatiga qo'yamiz (parallel javoblar bo'lmasin).
   runSerialized(chatId, async () => {
     const client = clientsStore.getById(chatId);
     if (!client) return;
-    await routeText(buf.ctx, client, combined, buf.businessConnectionId);
+    if (buf.fileIds.length > 0) {
+      // Rasm(lar) bor — matn caption sifatida qo'shiladi. BITTA javob.
+      await guardReply(buf.ctx, client, buf.businessConnectionId, "handlePhotos", combinedText || "(rasm)", () =>
+        handlePhotos(buf.ctx, client, buf.fileIds, buf.businessConnectionId, combinedText || undefined)
+      );
+    } else if (combinedText) {
+      await guardReply(buf.ctx, client, buf.businessConnectionId, "routeText", combinedText, () =>
+        routeText(buf.ctx, client, combinedText, buf.businessConnectionId)
+      );
+    }
   });
 }
 
@@ -542,10 +494,16 @@ async function sendGuaranteedFallback(
       samples,
       rephraseHint: (client.unresolvedCount ?? 0) >= 1,
     });
-    const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
+    let clean = reply;
+    let needAdmin = false;
+    if (clean.includes(NEED_ADMIN_TAG)) {
+      needAdmin = true;
+      clean = clean.split(NEED_ADMIN_TAG).join(" ").trim();
+    }
+    const parts = clean.split("###").map((p) => p.trim()).filter(Boolean);
     if (parts.length > 0) {
       addToHistory(client, "user", text);
-      addToHistory(client, "assistant", reply);
+      addToHistory(client, "assistant", clean);
       client.hasGreeted = true;
       client.lastInteractionDate = todayStr();
       clientsStore.save(client);
@@ -553,6 +511,7 @@ async function sendGuaranteedFallback(
         await sendMsg(ctx, client.chatId, part, businessConnectionId, { allowRepeat: true });
         if (parts.length > 1) await sleep(800);
       }
+      if (needAdmin && text) await notifyAdminsNoAnswer(ctx, client, text);
       return;
     }
   } catch (err) {
@@ -664,22 +623,63 @@ async function notifyAdminsClientStuck(
   }
 }
 
+// AI javobni bilim bazasida topa olmadi ([NEED_ADMIN] belgisi bilan) —
+// adminga aynan savolni yuboramiz, u javobni bilim bazasiga qo'shsin.
+// Bir xil mijoz-savol juftligi uchun bir marta (jarayon davomida).
+const notifiedNoAnswer = new Set<string>();
+async function notifyAdminsNoAnswer(
+  ctx: BotContext,
+  client: ClientData,
+  question: string
+): Promise<void> {
+  const key = `${client.chatId}:${question.trim().toLowerCase().slice(0, 80)}`;
+  if (notifiedNoAnswer.has(key)) return;
+  notifiedNoAnswer.add(key);
+
+  const text =
+    `⚠️ Mijoz savol berdi, lekin bilim bazasida javob yo'q:\n` +
+    `Savol: "${question.trim().slice(0, 300)}"\n` +
+    `Mijoz: ${client.firstName ?? "(ism yo'q)"}\n` +
+    `chatId: ${client.chatId}\n` +
+    `Model: ${client.lastModelName ?? "(noma'lum)"}\n\n` +
+    `Bu savolga javobni /panel orqali bilim bazasiga qo'shing.`;
+
+  for (const adminId of getAdminIds()) {
+    try {
+      await ctx.telegram.sendMessage(adminId, text);
+    } catch {
+      // ignore
+    }
+  }
+}
+
+// AI javobni bilim bazasidan topa olmasa promptga [NEED_ADMIN] qo'yadi
+// (XATO 3): bu belgini mijozdan yashiramiz va adminni xabardor qilamiz.
+const NEED_ADMIN_TAG = "[NEED_ADMIN]";
+
 // Mijoz javobini split qilib yuboradi; bo'sh bo'lsa hech narsa qilmaydi
-// (chaqiruvchi guardReply orqali kafolatlanadi). Yuborilgan matn tarixga
-// yoziladi.
+// (chaqiruvchi guardReply orqali kafolatlanadi). [NEED_ADMIN] belgisi bo'lsa
+// — uni olib tashlab, question berilgan bo'lsa adminni ogohlantiradi.
 async function sendReplyParts(
   ctx: BotContext,
   client: ClientData,
   reply: string,
-  businessConnectionId?: string
+  businessConnectionId?: string,
+  question?: string
 ): Promise<boolean> {
-  const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
-  if (parts.length === 0) return false;
+  let clean = reply;
+  let needAdmin = false;
+  if (clean.includes(NEED_ADMIN_TAG)) {
+    needAdmin = true;
+    clean = clean.split(NEED_ADMIN_TAG).join(" ").trim();
+  }
+  const parts = clean.split("###").map((p) => p.trim()).filter(Boolean);
   for (const part of parts) {
     await sendMsg(ctx, client.chatId, part, businessConnectionId);
     if (parts.length > 1) await sleep(800);
   }
-  return true;
+  if (needAdmin && question) await notifyAdminsNoAnswer(ctx, client, question);
+  return parts.length > 0;
 }
 
 async function sendVideoMsg(
@@ -879,12 +879,38 @@ async function deliverConnectionGuide(
 const LONG_RANGE_SUCCESS_RE =
   /(rahmat|raxmat|rahmet|tashakkur|bo'?ldi\b|buldi\b|ishladi|iwladi|zo'?r\b|zur\b|ulandi|ko'?rinyapti|korinyapti|korindi|hammasi joyida)/i;
 
+// Mijoz QISQA MASOFA / VIDEO / boshqa ulash usulini so'rasa — uzoq masofadan
+// chiqib, to'g'ri oqimga (video) o'tamiz.
+const SHORT_RANGE_SWITCH_RE =
+  /(qisqa masofa|qisqadan|yaqin masofa|yaqindan|video qo'?llanma|videoni|video bormi|video yo'?q|boshqacha ula|boshqa usul|близк|видео|коротк)/i;
+
+// Bot javobi ulanish MUVAFFAQIYATLI tugaganini bildirsa — holatni yopamiz.
+const LONG_RANGE_DONE_RE =
+  /(tabrikl|muvaffaqiyatli ulan|muvaffaqiyatli qo'?shil|endi ko'?rishingiz mumkin|hammasi tayyor|поздрав|успешно подключ|теперь можете)/i;
+
 async function handleLongRange(
   ctx: BotContext,
   client: ClientData,
   text: string,
   businessConnectionId?: string
 ): Promise<void> {
+  // Mijoz ulanish usulini O'ZGARTIRMOQCHI (qisqa masofa/video) bo'lsa — uzoq
+  // masofani to'xtatib, TO'G'RI oqimga o'tamiz. Faqat model qisqa masofa
+  // videosiga ega bo'lsa (aks holda foydasiz).
+  if (SHORT_RANGE_SWITCH_RE.test(text)) {
+    const model = client.lastModelName ? modelsStore.getByName(client.lastModelName) : undefined;
+    if (model && model.videoGuides.length > 0) {
+      logger.info({ chatId: client.chatId }, "long-range: mijoz qisqa masofaga o'tmoqchi — video yuboriladi");
+      client.longRangeStage = undefined;
+      client.connectionMethod = "short";
+      client.awaitingConnectionConfirm = false;
+      resetStuck(client);
+      clientsStore.save(client);
+      await sendShortRangeGuide(ctx, client, businessConnectionId);
+      return;
+    }
+  }
+
   if (client.longRangeStage === "asked_status") {
     await handleLongRangeAnswer(ctx, client, text, businessConnectionId);
   } else {
@@ -984,6 +1010,15 @@ async function runLongRangeGuiding(
     client.hasGreeted = true;
     client.lastInteractionDate = todayStr();
     client.unresolvedCount = 0;
+    // Bot javobi ulanish tugaganini bildirsa (masalan "Tabriklayman, ulandi") —
+    // uzoq masofa holatini YOPAMIZ, aks holda keyingi xabar (masalan "qisqa
+    // masofadan") baribir handleLongRange'ga tushib qolardi (XATO 1).
+    if (LONG_RANGE_DONE_RE.test(reply)) {
+      logger.info({ chatId: client.chatId }, "long-range: yakunlandi (bot javobi bo'yicha), holat yopildi");
+      client.longRangeStage = undefined;
+      client.connectionConfirmed = true;
+      client.gratitudeSent = true;
+    }
     clientsStore.save(client);
     return;
   }
@@ -1233,11 +1268,7 @@ async function handleUnknownBarcode(
   client.lastInteractionDate = todayStr();
   clientsStore.save(client);
 
-  const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
-  for (const part of parts) {
-    await sendMsg(ctx, chatId, part, businessConnectionId);
-    if (parts.length > 1) await sleep(800);
-  }
+  await sendReplyParts(ctx, client, reply, businessConnectionId);
 }
 
 function onlyDigits(s: string): string {
@@ -1360,11 +1391,7 @@ async function handleModelNameAnswer(
   client.lastInteractionDate = todayStr();
   clientsStore.save(client);
 
-  const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
-  for (const part of parts) {
-    await sendMsg(ctx, chatId, part, businessConnectionId);
-    if (parts.length > 1) await sleep(800);
-  }
+  await sendReplyParts(ctx, client, reply, businessConnectionId, text);
 }
 
 // ─── Muammo/istak statistikasi ────────────────────────────────────────────────
@@ -1614,13 +1641,9 @@ async function handleFirstContactNonText(
   client.lastInteractionDate = todayStr();
   clientsStore.save(client);
 
-  const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
-  for (const part of parts) {
-    await sendMsg(ctx, client.chatId, part, businessConnectionId);
-    if (parts.length > 1) await sleep(800);
-  }
+  await sendReplyParts(ctx, client, reply, businessConnectionId);
 
-  if (!client.askedForPhotoOnce) {
+  if (!client.askedForPhotoOnce && shouldAskForPhoto(client.chatId)) {
     client.askedForPhotoOnce = true;
     clientsStore.save(client);
     await sleep(800);
@@ -1685,11 +1708,7 @@ async function handleNonCameraPhoto(
   client.lastInteractionDate = todayStr();
   clientsStore.save(client);
 
-  const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
-  for (const part of parts) {
-    await sendMsg(ctx, chatId, part, businessConnectionId);
-    if (parts.length > 1) await sleep(800);
-  }
+  await sendReplyParts(ctx, client, reply, businessConnectionId, question);
 }
 
 // ─── Rasmlar ─────────────────────────────────────────────────────────────────
@@ -1720,6 +1739,22 @@ async function handlePhotos(
   if (clientImages.length === 0) {
     const msg = client.language !== "ru" ? "Rasmni o'qib bo'lmadi." : "Не удалось прочитать фото.";
     await sendMsg(ctx, chatId, msg, businessConnectionId);
+    return;
+  }
+
+  // XATO 4 — model ALLAQACHON aniqlangan bo'lsa, barcode/model aniqlashni
+  // UMUMAN ishga tushirmaymiz. Mijoz endi ko'pincha ilova skrinshotini yoki
+  // savolga oid rasm yuboradi — uni savolga javob berish uchun ishlatamiz.
+  if (client.lastModelName) {
+    // Uzoq masofa yo'riqnomasi davom etayotgan bo'lsa — matnni (caption) guiding
+    // oqimiga beramiz, progress buzilmasin.
+    if (client.longRangeStage && caption) {
+      await handleLongRange(ctx, client, caption, businessConnectionId);
+      return;
+    }
+    await randomDelay(15000, 40000);
+    const classification = await classifyImage(clientImages[0]!);
+    await handleNonCameraPhoto(ctx, client, classification, caption, businessConnectionId);
     return;
   }
 
@@ -1867,13 +1902,21 @@ async function handleText(
       resetStuck(client);
       clientsStore.save(client);
 
-      const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
-      for (const part of parts) {
-        await sendMsg(ctx, chatId, part, businessConnectionId);
-        if (parts.length > 1) await sleep(800);
-      }
+      await sendReplyParts(ctx, client, reply, businessConnectionId, text);
       return;
     }
+    // hasGreeted allaqachon true (suhbat o'rtasida "salom") — TO'LIQ salomlashma,
+    // yengil javob berib davom etamiz (XATO 5).
+    const backMsg = client.language !== "ru"
+      ? "Salom! Davom etamizmi?"
+      : "Здравствуйте! Продолжим?";
+    addToHistory(client, "user", text);
+    addToHistory(client, "assistant", backMsg);
+    client.lastInteractionDate = todayStr();
+    resetStuck(client);
+    clientsStore.save(client);
+    await sendMsg(ctx, chatId, backMsg, businessConnectionId);
+    return;
   }
 
   if (intent === "gratitude") {
@@ -1952,11 +1995,7 @@ async function handleText(
   resetStuck(client);
   clientsStore.save(client);
 
-  const parts = reply.split("###").map((p) => p.trim()).filter(Boolean);
-  for (const part of parts) {
-    await sendMsg(ctx, chatId, part, businessConnectionId);
-    if (parts.length > 1) await sleep(800);
-  }
+  await sendReplyParts(ctx, client, reply, businessConnectionId, text);
 
   if (!cameraModel && !client.askedForPhotoOnce && shouldAskForPhoto(chatId)) {
     client.askedForPhotoOnce = true;
