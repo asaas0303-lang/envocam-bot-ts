@@ -1317,6 +1317,44 @@ function onlyDigits(s: string): string {
   return s.replace(/\D/g, "");
 }
 
+// Ikki satr orasidagi tahrirlash (Levenshtein) masofasi 1 dan oshmasligini
+// tekshiradi (bitta almashtirish, qo'shish yoki o'chirish). To'liq DP jadval
+// kerak emas — chiziqli vaqtda, faqat "<=1" savoliga javob beradigan tezkor
+// algoritm (OCR bitta raqamni xato o'qigan holatlarni topish uchun yetarli).
+function isEditDistanceAtMostOne(a: string, b: string): boolean {
+  if (a === b) return true;
+  const lenDiff = a.length - b.length;
+  if (Math.abs(lenDiff) > 1) return false;
+
+  if (lenDiff === 0) {
+    // Bir xil uzunlik — faqat BITTA pozitsiyada farq bo'lishi kerak (almashtirish).
+    let diffCount = 0;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) {
+        diffCount++;
+        if (diffCount > 1) return false;
+      }
+    }
+    return diffCount === 1;
+  }
+
+  // Uzunlik 1 taga farq qiladi — bitta qo'shish/o'chirish bilan moslashtirib bo'ladimi.
+  const shorter = lenDiff < 0 ? a : b;
+  const longer = lenDiff < 0 ? b : a;
+  let i = 0, j = 0, skipped = false;
+  while (i < shorter.length && j < longer.length) {
+    if (shorter[i] === longer[j]) {
+      i++;
+      j++;
+    } else {
+      if (skipped) return false;
+      skipped = true;
+      j++;
+    }
+  }
+  return true;
+}
+
 // Barcode solishtirish — IKKALA tomon ham faqat raqamlarga keltirilib
 // solishtiriladi (bo'sh joy, defis, URL bo'laklari e'tiborsiz qoladi).
 // isPartial=true bo'lsa faqat oxirgi 4 raqam solishtiriladi (OCR last4 uchun).
@@ -1337,7 +1375,7 @@ function findModelByDigits(
     return matches.length === 1 ? matches[0] : undefined;
   }
 
-  return models.find((m) =>
+  const exactOrPrefix = models.find((m) =>
     m.barcodes.some((b) => {
       const bd = onlyDigits(b);
       if (!bd) return false;
@@ -1349,6 +1387,43 @@ function findModelByDigits(
       return shorter.length >= 10 && longer.endsWith(shorter);
     })
   );
+  if (exactOrPrefix) return exactOrPrefix;
+
+  // FUZZY MOSLIK — faqat 10+ xonali raqamlarda (qisqa raqamlarda 1 belgi
+  // farq juda ko'p mos kelib ketishi mumkin). OCR ba'zan bitta raqamni xato
+  // o'qiydi (masalan 9 o'rniga 8) — bazadagi barcode ANIQ shu raqamdan 1
+  // tahrirlash masofasida bo'lsa va bunday model FAQAT BITTA bo'lsa, shuni
+  // ishonchli deb qabul qilamiz. Bir nechta model mos kelsa — noaniqlik,
+  // hech birini tanlamaymiz (mijoz yordamsiz qolmasin mexanizmi ishlaydi).
+  if (d.length >= 10) {
+    const fuzzyMatches: { model: CameraModel; barcode: string }[] = [];
+    for (const m of models) {
+      for (const b of m.barcodes) {
+        const bd = onlyDigits(b);
+        if (bd.length < 10) continue;
+        if (isEditDistanceAtMostOne(bd, d)) {
+          fuzzyMatches.push({ model: m, barcode: bd });
+          break;
+        }
+      }
+    }
+    if (fuzzyMatches.length === 1) {
+      const match = fuzzyMatches[0]!;
+      logger.info(
+        { ocr: d, matched: match.barcode, model: match.model.name },
+        `barcode: Fuzzy moslik topildi — OCR ${d} → bazadagi ${match.barcode} (${match.model.name}), masofa=1`
+      );
+      return match.model;
+    }
+    if (fuzzyMatches.length > 1) {
+      logger.info(
+        { ocr: d, candidates: fuzzyMatches.map((f) => `${f.model.name}:${f.barcode}`) },
+        "barcode: Fuzzy moslik NOANIQ — bir nechta model 1-masofada, hech biri tanlanmadi"
+      );
+    }
+  }
+
+  return undefined;
 }
 
 // QADAM 4 — barcode avtomatik o'qilmasa, admin yuklagan namuna rasm (stiker
