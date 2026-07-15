@@ -171,6 +171,17 @@ async function callClaude(
 const SHORTHAND_UZ_NOTE =
   `MUHIM: Mijozlar ko'pincha qisqartma/xato o'zbekchada yozadi — 'sh' o'rniga 'w' (bowidan=boshidan, iwxona=ishxona, tuwunasz=tushunasiz), unlilar tushib qoladi (kop=ko'p, korib=ko'rib), maxsus harflar oddiy yoziladi. Shuni hisobga olib ma'noni to'g'ri tushun.`;
 
+// Do'kon o'zligi + haydab yubormaslik + fayl yubora olmaslik + bilim yo'q
+// bo'lsa [NEED_ADMIN] belgisi. BARCHA mijozga javob beradigan AI chaqiruvlari
+// (answerQuestion, answerLongRangeStep) shu qoidalarga bo'ysunishi kerak —
+// aks holda ba'zi oqimlarda bot "sotuvchidan so'rang" deb yuborishi yoki
+// yubora olmaydigan faylni "hozir yuboraman" deb va'da qilishi mumkin edi.
+function buildStoreRules(isUz: boolean): string {
+  return isUz
+    ? `\n\nMUHIM QOIDALAR:\n- Sen EnvoCam kamera do'konining RASMIY yordamchisisan — SEN O'ZING do'konsan.\n- HECH QACHON mijozni "do'konga murojaat qiling", "sotuvchidan so'rang", "texnik xizmatga murojaat qiling" yoki boshqa joyga yuborma. Bu QAT'IY TAQIQLANGAN.\n- Sen video/rasm/fayl O'ZING yubora OLMAYSAN — buni alohida tizim boshqaradi. Shuning uchun "yuboraman", "hozir yuboraman", "qaytadan yuboraman" deb HECH QACHON VA'DA BERMA. Agar mijoz video/fayl so'rasa, shunchaki bor-yo'qligini ayt yoki savoliga matn bilan javob ber — yuborish harakatini SEN emas, tizim bajaradi.\n- Javobni ANIQ bilmasang (ma'lumot bazangda yo'q bo'lsa) — iliq ayt: "Buni aniqlab, sizga tez orada javob beraman", va butun javobingni AYNAN shu belgi bilan boshla: [NEED_ADMIN] (bu belgi mijozga ko'rsatilmaydi, admin xabardor bo'lishi uchun).`
+    : `\n\nВАЖНЫЕ ПРАВИЛА:\n- Ты ОФИЦИАЛЬНЫЙ помощник магазина камер EnvoCam — ты САМ и есть магазин.\n- НИКОГДА не отправляй клиента "обратитесь в магазин", "спросите у продавца", "в техподдержку" и т.п. Это СТРОГО запрещено.\n- Ты САМ не можешь отправить видео/фото/файл — это делает отдельная система. Поэтому НИКОГДА не обещай "сейчас пришлю", "отправлю ещё раз" — просто скажи, есть ли это, или ответь текстом на вопрос.\n- Если точного ответа не знаешь (нет в базе) — тепло скажи: "Уточню и скоро вам отвечу" и начни весь ответ РОВНО с метки [NEED_ADMIN] (она не видна клиенту, для уведомления администратора).`;
+}
+
 // ─── Rasm tahlili ─────────────────────────────────────────────────────────────
 
 export interface ImageInput {
@@ -283,8 +294,8 @@ Mijoz javobi: "${answer}"
 ${SHORTHAND_UZ_NOTE}
 
 Mijoz nimani nazarda tutyapti?
-- "start_over": boshidan boshlash kerak / hali qo'shilmagan / qo'sha olmadi ("boshidan", "bowidan", "yo'q", "yoq", "qo'sholmadim", "ulab bo'lmadi")
-- "already_added": kamera ilovaga allaqachon qo'shilgan ("ha", "qo'shilgan", "bor", "qo'shdim")
+- "start_over": boshidan boshlash kerak / hali qo'shilmagan / qo'sha olmadi / ulanmagan ("boshidan", "bowidan", "yo'q", "yoq", "qo'sholmadim", "ulab bo'lmadi", "ulanmagan", "ulanmayapti", "qo'shilmagan", "qo'shila olmadim", "hali yo'q")
+- "already_added": kamera ilovaga allaqachon qo'shilgan ("ha", "qo'shilgan", "bor", "qo'shdim", "ulangan")
 - "unclear": aniq emas
 
 Faqat JSON: {"kind":"start_over|already_added|unclear"}`,
@@ -298,6 +309,37 @@ Faqat JSON: {"kind":"start_over|already_added|unclear"}`,
     return "unclear";
   } catch {
     return "unclear";
+  }
+}
+
+// ─── Video (qisqa masofa) qayta so'ralganini tasniflash ───────────────────────
+
+// Bot AI orqali matn javob bera oladi, lekin video yubora OLMAYDI (buni
+// alohida tizim bajaradi). Shuning uchun mijoz videoni (qayta) so'raganda,
+// buni AI'ga emas, to'g'ridan-to'g'ri video yuboruvchi funksiyaga yo'naltirish
+// kerak. Arzon regex-filtr orqali faqat shubhali xabarlarda chaqiriladi.
+export async function classifyVideoRequest(text: string): Promise<boolean> {
+  try {
+    const response = await callClaude("classifyVideoRequest", {
+      model: MODEL,
+      max_tokens: 16,
+      messages: [
+        {
+          role: "user",
+          content: `Mijozga kamera ulash video-qo'llanmasi avval yuborilgan. Mijoz keyingi xabari: "${text}"
+
+Mijoz shu video-qo'llanmani (QAYTA) yuborishni so'ramoqdami — masalan video kelmadi/ko'rinmadi/ochilmadi degani, yoki "video bormi", "qachon yuborasiz", "qayta yubor", "yana yubor" kabi so'rov? Yoki bu BOSHQA narsa — kamera haqida savol/muammo, minnatdorchilik, umuman boshqa mavzu?
+
+Faqat JSON qaytar: {"wantsVideo": true|false}`,
+        },
+      ],
+    });
+    const jsonMatch = extractText(response).match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return false;
+    const parsed = JSON.parse(jsonMatch[0]) as { wantsVideo?: boolean };
+    return parsed.wantsVideo === true;
+  } catch {
+    return false;
   }
 }
 
@@ -347,10 +389,12 @@ ${guideBlock}`
 
 ${guideBlock}`;
 
+  const finalSystemPrompt = systemPrompt + buildStoreRules(isUz);
+
   const response = await callClaude("answerLongRange", {
     model: MODEL,
     max_tokens: 700,
-    system: systemPrompt,
+    system: finalSystemPrompt,
     messages: buildMessages(history.slice(-16), question),
   });
 
@@ -801,10 +845,7 @@ ${samples.length > 0
     }
   }
 
-  // Do'kon o'zligi + haydab yubormaslik + bilim yo'q bo'lsa [NEED_ADMIN] belgisi.
-  const storeRules = isUz
-    ? `\n\nMUHIM QOIDALAR:\n- Sen EnvoCam kamera do'konining RASMIY yordamchisisan — SEN O'ZING do'konsan.\n- HECH QACHON mijozni "do'konga murojaat qiling", "sotuvchidan so'rang", "texnik xizmatga murojaat qiling" yoki boshqa joyga yuborma. Bu QAT'IY TAQIQLANGAN.\n- Javobni ANIQ bilmasang (ma'lumot bazangda yo'q bo'lsa) — iliq ayt: "Buni aniqlab, sizga tez orada javob beraman", va butun javobingni AYNAN shu belgi bilan boshla: [NEED_ADMIN] (bu belgi mijozga ko'rsatilmaydi, admin xabardor bo'lishi uchun).`
-    : `\n\nВАЖНЫЕ ПРАВИЛА:\n- Ты ОФИЦИАЛЬНЫЙ помощник магазина камер EnvoCam — ты САМ и есть магазин.\n- НИКОГДА не отправляй клиента "обратитесь в магазин", "спросите у продавца", "в техподдержку" и т.п. Это СТРОГО запрещено.\n- Если точного ответа не знаешь (нет в базе) — тепло скажи: "Уточню и скоро вам отвечу" и начни весь ответ РОВНО с метки [NEED_ADMIN] (она не видна клиенту, для уведомления администратора).`;
+  const storeRules = buildStoreRules(isUz);
 
   const finalSystemPrompt = (language === "uz-cyrl"
     ? systemPrompt + `\n\nMUHIM: Mijoz sizga kirill yozuvida yozmoqda. Javobingizni FAQAT kirill yozuvida yozing (lotin emas) — masalan "Assalomu alaykum" emas "Ассалому алайкум", "Rahmat" emas "Раҳмат" deb yozing.`

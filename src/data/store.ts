@@ -205,6 +205,7 @@ export type AiFunctionName =
   | "classifyRegion"
   | "classifySurveyReply"
   | "classifyLongRangeAnswer"
+  | "classifyVideoRequest"
   | "answerLongRange"
   | "analyzeInsights"
   | "analyzeFeedback"

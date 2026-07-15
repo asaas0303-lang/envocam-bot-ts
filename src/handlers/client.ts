@@ -30,6 +30,7 @@ import {
   classifyImage,
   classifySurveyReply,
   classifyLongRangeAnswer,
+  classifyVideoRequest,
   answerLongRangeStep,
   type ImageClassification,
 } from "../ai.js";
@@ -1004,7 +1005,7 @@ async function runLongRangeGuiding(
     fromStart,
   });
 
-  const sent = await sendReplyParts(ctx, client, reply, businessConnectionId);
+  const sent = await sendReplyParts(ctx, client, reply, businessConnectionId, text);
   if (sent) {
     addToHistory(client, "assistant", reply);
     client.hasGreeted = true;
@@ -1713,6 +1714,24 @@ async function handleNonCameraPhoto(
 
 // ─── Rasmlar ─────────────────────────────────────────────────────────────────
 
+// AI rasm tahlili vaqtinchalik xato berishi mumkin (tarmoq, timeout,
+// limit). Bir marta jimgina qayta urinamiz — har ikkalasi ham
+// muvaffaqiyatsiz bo'lsa, sabab batafsil loglanadi va xato tashlanadi
+// (chaqiruvchi buni ushlab, mijozga aniq javob beradi).
+async function withPhotoRetry<T>(label: string, chatId: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    logger.error({ err, chatId, label }, `${label}: birinchi urinish muvaffaqiyatsiz, qayta urinilmoqda`);
+    try {
+      return await fn();
+    } catch (err2) {
+      logger.error({ err: err2, chatId, label }, `${label}: qayta urinish ham muvaffaqiyatsiz`);
+      throw err2;
+    }
+  }
+}
+
 async function handlePhotos(
   ctx: BotContext,
   client: ClientData,
@@ -1742,97 +1761,121 @@ async function handlePhotos(
     return;
   }
 
-  // XATO 4 — model ALLAQACHON aniqlangan bo'lsa, barcode/model aniqlashni
-  // UMUMAN ishga tushirmaymiz. Mijoz endi ko'pincha ilova skrinshotini yoki
-  // savolga oid rasm yuboradi — uni savolga javob berish uchun ishlatamiz.
-  if (client.lastModelName) {
-    // Uzoq masofa yo'riqnomasi davom etayotgan bo'lsa — matnni (caption) guiding
-    // oqimiga beramiz, progress buzilmasin.
-    if (client.longRangeStage && caption) {
-      await handleLongRange(ctx, client, caption, businessConnectionId);
+  // XATO 4 — rasm tahlilida AI xatosi bo'lsa, generik "xatolik yuz berdi"
+  // o'rniga: sababni batafsil loglaymiz, bir marta qayta urinamiz, admin'ni
+  // xabardor qilamiz va mijozga aniq, iliq javob beramiz.
+  try {
+    // XATO 4 (oldingi) — model ALLAQACHON aniqlangan bo'lsa, barcode/model
+    // aniqlashni UMUMAN ishga tushirmaymiz. Mijoz endi ko'pincha ilova
+    // skrinshotini yoki savolga oid rasm yuboradi — savolga javob uchun ishlatamiz.
+    if (client.lastModelName) {
+      // Uzoq masofa yo'riqnomasi davom etayotgan bo'lsa — matnni (caption) guiding
+      // oqimiga beramiz, progress buzilmasin.
+      if (client.longRangeStage && caption) {
+        await handleLongRange(ctx, client, caption, businessConnectionId);
+        return;
+      }
+      await randomDelay(15000, 40000);
+      const classification = await withPhotoRetry("classifyImage", chatId, () => classifyImage(clientImages[0]!));
+      await handleNonCameraPhoto(ctx, client, classification, caption, businessConnectionId);
       return;
     }
+
+    // Rasm bilan birga izoh (caption) kelgan bo'lsa, undan ulash usulini
+    // aniqlashga harakat qilamiz — mijozga qayta so'ramaslik uchun.
+    if (caption && !client.connectionMethod) {
+      const { connectionMethod } = await detectIntent(caption);
+      if (connectionMethod) {
+        client.connectionMethod = connectionMethod;
+        clientsStore.save(client);
+      }
+    }
+
+    // Avval rasm turini aniqlaymiz — mijoz ko'pincha kamera/quti o'rniga
+    // ilova skrinshoti yoki qo'llanma varag'i yuboradi. Bunday holda katta
+    // (barcha modellar bo'yicha) model-aniqlash chaqiruvini umuman qilmaymiz —
+    // bu ham xarajatni tejaydi, ham mijozga to'g'ri javob beradi.
+    const classification = await withPhotoRetry("classifyImage", chatId, () => classifyImage(clientImages[0]!));
+    if (classification.kind !== "camera_or_box") {
+      await handleNonCameraPhoto(ctx, client, classification, caption, businessConnectionId);
+      return;
+    }
+
+    // Barcode raqamini AVTOMATIK o'qishga harakat qilamiz — avval QR kod
+    // (eng ishonchli, AI chaqirmaydi), keyin AI-OCR fallback. QR raqami bazaga
+    // mos kelmasa, to'xtamay bosma raqamni OCR bilan o'qishga o'tadi. Mijozdan
+    // hech qachon raqamni qo'lda yozib yuborish so'ralmaydi.
     await randomDelay(15000, 40000);
-    const classification = await classifyImage(clientImages[0]!);
-    await handleNonCameraPhoto(ctx, client, classification, caption, businessConnectionId);
-    return;
-  }
 
-  // Rasm bilan birga izoh (caption) kelgan bo'lsa, undan ulash usulini
-  // aniqlashga harakat qilamiz — mijozga qayta so'ramaslik uchun.
-  if (caption && !client.connectionMethod) {
-    const { connectionMethod } = await detectIntent(caption);
-    if (connectionMethod) {
-      client.connectionMethod = connectionMethod;
-      clientsStore.save(client);
+    const outcome = await withPhotoRetry("readBarcodeFromImage", chatId, () =>
+      readBarcodeFromImage(clientImages[0]!, chatId, (digits, isPartial) =>
+        !!findModelByDigits(models, digits, isPartial)
+      )
+    );
+    client = clientsStore.getById(client.chatId) ?? client;
+
+    if (outcome.match) {
+      const matchedModel = findModelByDigits(models, outcome.match.value, outcome.match.isPartial);
+      if (matchedModel) {
+        client.lastModelName = matchedModel.name;
+        client.hasGreeted = true;
+        client.lastInteractionDate = todayStr();
+        client.barcodeAttempts = 0;
+        resetStuck(client);
+        clientsStore.save(client);
+        modelMentionsStore.record(matchedModel.name, client.chatId);
+        await announceModel(ctx, client, matchedModel.name, businessConnectionId);
+        await sleep(800);
+        await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
+        return;
+      }
     }
-  }
 
-  // Avval rasm turini aniqlaymiz — mijoz ko'pincha kamera/quti o'rniga
-  // ilova skrinshoti yoki qo'llanma varag'i yuboradi. Bunday holda katta
-  // (barcha modellar bo'yicha) model-aniqlash chaqiruvini umuman qilmaymiz —
-  // bu ham xarajatni tejaydi, ham mijozga to'g'ri javob beradi.
-  const classification = await classifyImage(clientImages[0]!);
-  if (classification.kind !== "camera_or_box") {
-    await handleNonCameraPhoto(ctx, client, classification, caption, businessConnectionId);
-    return;
-  }
-
-  // Barcode raqamini AVTOMATIK o'qishga harakat qilamiz — avval QR kod
-  // (eng ishonchli, AI chaqirmaydi), keyin AI-OCR fallback. QR raqami bazaga
-  // mos kelmasa, to'xtamay bosma raqamni OCR bilan o'qishga o'tadi. Mijozdan
-  // hech qachon raqamni qo'lda yozib yuborish so'ralmaydi.
-  await randomDelay(15000, 40000);
-
-  const outcome = await readBarcodeFromImage(clientImages[0]!, chatId, (digits, isPartial) =>
-    !!findModelByDigits(models, digits, isPartial)
-  );
-  client = clientsStore.getById(client.chatId) ?? client;
-
-  if (outcome.match) {
-    const matchedModel = findModelByDigits(models, outcome.match.value, outcome.match.isPartial);
-    if (matchedModel) {
-      client.lastModelName = matchedModel.name;
-      client.hasGreeted = true;
-      client.lastInteractionDate = todayStr();
+    // Mos model topilmadi. Agar TO'LIQ raqam o'qilgan bo'lsa (QR yoki OCR) —
+    // bu haqiqiy, lekin ro'yxatda yo'q barcode: adminni xabardor qilamiz va
+    // mijozga umumiy yordam beramiz. Rasmni QAYTA SO'RAMAYMIZ (bir marta yordam).
+    if (outcome.bestRead && onlyDigits(outcome.bestRead.value).length >= 8) {
       client.barcodeAttempts = 0;
-      resetStuck(client);
       clientsStore.save(client);
-      modelMentionsStore.record(matchedModel.name, client.chatId);
-      await announceModel(ctx, client, matchedModel.name, businessConnectionId);
-      await sleep(800);
-      await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
+      await handleUnknownBarcode(ctx, client, outcome.bestRead.value, businessConnectionId);
       return;
     }
-  }
 
-  // Mos model topilmadi. Agar TO'LIQ raqam o'qilgan bo'lsa (QR yoki OCR) —
-  // bu haqiqiy, lekin ro'yxatda yo'q barcode: adminni xabardor qilamiz va
-  // mijozga umumiy yordam beramiz. Rasmni QAYTA SO'RAMAYMIZ (bir marta yordam).
-  if (outcome.bestRead && onlyDigits(outcome.bestRead.value).length >= 8) {
-    client.barcodeAttempts = 0;
+    // Hech qanday ishonchli raqam o'qilmadi — yaqinroq rasm / model nomi zinapoyasi.
+    client.barcodeAttempts = (client.barcodeAttempts ?? 0) + 1;
     clientsStore.save(client);
-    await handleUnknownBarcode(ctx, client, outcome.bestRead.value, businessConnectionId);
-    return;
-  }
 
-  // Hech qanday ishonchli raqam o'qilmadi — yaqinroq rasm / model nomi zinapoyasi.
-  client.barcodeAttempts = (client.barcodeAttempts ?? 0) + 1;
-  clientsStore.save(client);
-
-  if (client.barcodeAttempts <= 2) {
-    // QADAM 4 — yaqinroq rasm so'raymiz (namuna rasm bilan birga, mavjud bo'lsa).
-    await sendCloserPhotoRequest(ctx, client, businessConnectionId);
-  } else {
-    // QADAM 5 — ikki marta rasm ham yordam bermadi, oxirgi chora sifatida
-    // model nomini matn bilan so'raymiz.
-    client.awaitingModelName = true;
-    clientsStore.save(client);
-    await sendMsg(ctx, chatId, askForModelNameText(client.language), businessConnectionId, { allowRepeat: true });
+    if (client.barcodeAttempts <= 2) {
+      // QADAM 4 — yaqinroq rasm so'raymiz (namuna rasm bilan birga, mavjud bo'lsa).
+      await sendCloserPhotoRequest(ctx, client, businessConnectionId);
+    } else {
+      // QADAM 5 — ikki marta rasm ham yordam bermadi, oxirgi chora sifatida
+      // model nomini matn bilan so'raymiz.
+      client.awaitingModelName = true;
+      clientsStore.save(client);
+      await sendMsg(ctx, chatId, askForModelNameText(client.language), businessConnectionId, { allowRepeat: true });
+    }
+  } catch (err) {
+    logger.error({ err, chatId }, "handlePhotos: rasmni tahlil qilishda takroriy xatolik");
+    await notifyAdminsClientStuck(
+      ctx,
+      client,
+      `Rasmni tahlil qilishda AI xatosi: ${err instanceof Error ? err.message : String(err)}`
+    );
+    const msg = client.language !== "ru"
+      ? "Rasmni ko'rishda birozgina qiynalyapman. Shu orada, savolingiz yoki muammoyingizni matn bilan yozib bera olasizmi — darhol yordam beraman."
+      : "У меня небольшие сложности с обработкой фото. Пока опишите вопрос или проблему текстом — я сразу помогу.";
+    await sendMsg(ctx, chatId, msg, businessConnectionId, { allowRepeat: true });
   }
 }
 
 // ─── Matn ─────────────────────────────────────────────────────────────────────
+
+// Arzon regex-filtr — VIDEO_REQUEST_HINT_RE mos kelgan xabarlarda GINA AI
+// klassifikatori (classifyVideoRequest) chaqiriladi, aks holda har bir
+// xabarga qo'shimcha AI chaqiruvi qo'shilib, xarajatni oshirardi.
+const VIDEO_REQUEST_HINT_RE =
+  /(video|видео|qo'?llanma|qayta|qaytadan|yana|kelmadi|qachon|yubor|отправ|пришл|когда)/i;
 
 async function handleText(
   ctx: BotContext,
@@ -1844,6 +1887,24 @@ async function handleText(
 
   if (!client.hasGreeted) {
     client.language = detectLanguage(text);
+  }
+
+  // XATO 1 — mijoz QISQA MASOFA videosini (qayta) so'rasa, bu AI'ga EMAS,
+  // to'g'ridan-to'g'ri video yuboruvchi funksiyaga ketishi kerak. AI matn
+  // bilan "yuboraman" deb va'da berishi mumkin, lekin video yubora olmaydi —
+  // shuning uchun bu so'rovni har doim shu yerda, harakat bilan hal qilamiz.
+  if (client.connectionMethod === "short" && VIDEO_REQUEST_HINT_RE.test(text)) {
+    const wantsVideo = await classifyVideoRequest(text);
+    if (wantsVideo) {
+      logger.info({ chatId }, "handleText: video (qayta) so'rovi aniqlandi — video yuborilmoqda");
+      addToHistory(client, "user", text);
+      client.hasGreeted = true;
+      client.lastInteractionDate = todayStr();
+      resetStuck(client);
+      clientsStore.save(client);
+      await sendShortRangeGuide(ctx, client, businessConnectionId);
+      return;
+    }
   }
 
   const { intent, connectionMethod, productFeedback } = await detectIntent(text);
