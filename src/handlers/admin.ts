@@ -13,13 +13,14 @@ import {
   activityStore,
   settingsStore,
   usageStore,
+  questionLogStore,
   type CameraModel,
   type ClientData,
   type FaqItem,
 } from "../data/store.js";
 import { isAdmin, downloadFileAsBase64, sleep } from "../helpers.js";
 import { logger } from "../lib/logger.js";
-import { extractTextFromImage, analyzeInsights } from "../ai.js";
+import { extractTextFromImage, analyzeInsights, analyzeQuestionClusters } from "../ai.js";
 import { COLLAGE_MAX_IMAGES, rebuildModelCollageForDiagnostics } from "../collage.js";
 import { sendReportNow } from "../tasks.js";
 import {
@@ -157,6 +158,7 @@ const ADMIN_HELP_TEXT = [
   "/hisobot — mijoz fikrlari bo'yicha AI haftalik hisobotni HOZIR yuboradi",
   "/stats — statistika menyusini ochadi (joylashuv, muammolar, modellar va h.k.)",
   "/xarajat — API xarajat hisoboti (bugungi/7 kunlik/jami sarf, qolgan balans, taxminiy kunlar)",
+  "/savollar — mijoz savollarini mavzuga ko'ra AI bilan tahlil qiladi, eng ko'p so'ralganlarini va bilim bazasida yo'qlarini ko'rsatadi. /savollar <kun soni> — davrni tanlash (standart 30 kun)",
   "/testreset — bitta mijozning suhbat holatini yangi mijozdek tozalaydi (sinov uchun). Argumentsiz — oxirgi 15 mijoz ro'yxati; /testreset <raqam> — ro'yxatdan tanlash; /testreset <ism/matn> — qidirish; /testreset <chatId> — to'g'ridan-to'g'ri",
   "/yordam — shu ro'yxat",
 ].join("\n");
@@ -361,6 +363,54 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     await ctx.reply(text, Markup.inlineKeyboard([
       [Markup.button.callback("API balans", "admin_api_balance")],
     ]));
+  });
+
+  // ── Mijoz savollarini mavzuga ko'ra tahlil qilish (bilim bazasini to'ldirish uchun) ──
+  bot.command("savollar", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    const rawText = ("text" in ctx.message ? ctx.message.text : "") as string;
+    const arg = rawText.replace(/^\/savollar(@\S+)?\s*/i, "").trim();
+    const days = /^\d+$/.test(arg) ? Math.max(1, Math.min(365, Number(arg))) : 30;
+
+    const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
+    const entries = questionLogStore.getSince(sinceMs);
+
+    if (entries.length < 5) {
+      await ctx.reply(`Hali yetarli savol yig'ilmagan (oxirgi ${days} kunda ${entries.length} ta). Kamida 5 ta savol kerak.`);
+      return;
+    }
+
+    await ctx.reply(`Tahlil qilinmoqda (${entries.length} ta savol)...`);
+
+    const allModels = modelsStore.getAll();
+    const existingFaq = [
+      ...allModels.flatMap((m) => m.faqItems.map((f) => f.question)),
+      ...settingsStore.getGlobalFaqItems().map((f) => f.question),
+    ];
+
+    const clusters = await analyzeQuestionClusters(entries.map((e) => e.question), existingFaq);
+
+    if (clusters.length === 0) {
+      await ctx.reply("Tahlil qilishda xatolik yuz berdi yoki natija bo'sh. Birozdan so'ng qayta urinib ko'ring.");
+      return;
+    }
+
+    const lines: string[] = [`📊 Oxirgi ${days} kunda savollar tahlili (jami ${entries.length} ta savol):`, ""];
+    const missingTopics: string[] = [];
+    clusters.forEach((c, i) => {
+      lines.push(`${i + 1}. ${c.topic} — ${c.count} marta`);
+      if (c.examples.length > 0) lines.push(`   Misol: ${c.examples.map((e) => `"${e}"`).join(", ")}`);
+      lines.push(`   Bilim bazasida: ${c.inKnowledgeBase ? "✅ bor" : "❌ YO'Q — qo'shish tavsiya etiladi"}`);
+      lines.push("");
+      if (!c.inKnowledgeBase) missingTopics.push(c.topic);
+    });
+
+    if (missingTopics.length > 0) {
+      lines.push(`❗ Quyidagilarni FAQ'ga qo'shishni tavsiya qilaman:`);
+      missingTopics.forEach((t) => lines.push(`- ${t}`));
+    }
+
+    await sendChunkedReply(ctx, lines.join("\n"));
   });
 
   // ── Sinov uchun: bitta mijozning suhbat holatini tozalash ──

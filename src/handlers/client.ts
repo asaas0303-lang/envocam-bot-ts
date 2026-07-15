@@ -9,6 +9,7 @@ import {
   refundEventsStore,
   activityStore,
   settingsStore,
+  questionLogStore,
   type ClientData,
   type CameraModel,
   type MessageRecord,
@@ -1005,6 +1006,15 @@ async function runLongRangeGuiding(
     history: client.messageHistory || [],
     fromStart,
   });
+
+  if (reply) {
+    questionLogStore.record({
+      chatId: client.chatId,
+      question: text,
+      model: client.lastModelName ?? null,
+      wasAnsweredFromKB: !reply.includes(NEED_ADMIN_TAG),
+    });
+  }
 
   const sent = await sendReplyParts(ctx, client, reply, businessConnectionId, text);
   if (sent) {
@@ -2049,6 +2059,18 @@ async function handleText(
     history: client.messageHistory || [],
     samples,
   });
+
+  // Bilim bazasini samarali to'ldirish uchun — mijozning haqiqiy savolini
+  // (sintetik/avtomatik matn emas) jurnalga qayd etamiz. /savollar buyrug'i
+  // shu jurnalni tahlil qilib eng ko'p takrorlanadigan mavzularni topadi.
+  if (reply) {
+    questionLogStore.record({
+      chatId: client.chatId,
+      question: text,
+      model: client.lastModelName ?? null,
+      wasAnsweredFromKB: !reply.includes(NEED_ADMIN_TAG),
+    });
+  }
 
   addToHistory(client, "user", text);
   addToHistory(client, "assistant", reply);

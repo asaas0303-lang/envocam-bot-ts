@@ -995,3 +995,74 @@ Hisobot o'zbek tilida, aniq va amaliy bo'lsin. Emoji ishlatma. Boshida "Haftalik
 
   return extractText(response) || "Tahlil qilishda xatolik yuz berdi.";
 }
+
+// ─── Mijoz savollarini mavzuga ko'ra guruhlash (/savollar buyrug'i) ───────────
+
+export interface QuestionCluster {
+  topic: string;
+  count: number;
+  examples: string[];
+  inKnowledgeBase: boolean;
+}
+
+// questionLogStore'dan yig'ilgan xom savol matnlarini MA'NOSIGA ko'ra
+// guruhlaydi (imlo/til/xato farqiga qaramay) va har bir guruhni mavjud FAQ
+// ro'yxati bilan solishtirib, bilim bazasida bor-yo'qligini aniqlaydi.
+export async function analyzeQuestionClusters(
+  questions: string[],
+  existingFaqQuestions: string[]
+): Promise<QuestionCluster[]> {
+  const questionsList = questions.map((q, i) => `${i + 1}. ${q}`).join("\n");
+  const faqList = existingFaqQuestions.length > 0
+    ? existingFaqQuestions.map((q) => `- ${q}`).join("\n")
+    : "(hali FAQ yo'q)";
+
+  try {
+    const response = await callClaude("analyzeQuestionClusters", {
+      model: MODEL,
+      max_tokens: 4096,
+      messages: [
+        {
+          role: "user",
+          content: `Quyida mijozlar so'ragan ${questions.length} ta savol matni bor (turli imlo, til, xato bilan yozilgan bo'lishi mumkin):
+
+${questionsList}
+
+Mavjud bilim bazasidagi (FAQ) savollar ro'yxati:
+${faqList}
+
+VAZIFA:
+1. Yuqoridagi mijoz savollarini MA'NOSIGA ko'ra guruhla — bir xil mavzudagi savollarni (turli so'z, imlo xatosi, kirill/lotin farqiga qaramay) BITTA guruhga birlashtir.
+2. Har bir guruh uchun: qisqa umumiy mavzu nomi (2-5 so'z, o'zbek tilida), nechta marta so'ralgani, 1-2 ta aniq misol matn (asl matndan, o'zgartirmasdan).
+3. Har bir guruh uchun, yuqoridagi FAQ ro'yxati bilan solishtirib, shu mavzu FAQ'da ALLAQACHON qamrab olingan-olinmaganini aniqla (inKnowledgeBase: true agar mavzu FAQ'dagi biror savolga mos kelsa, aks holda false).
+4. Eng ko'p so'ralgan guruhdan kamigacha tartibla.
+
+Faqat JSON massiv qaytar, boshqa hech narsa yozma:
+[{"topic": "...", "count": N, "examples": ["...", "..."], "inKnowledgeBase": true|false}, ...]`,
+        },
+      ],
+    });
+
+    const raw = extractText(response);
+    const jsonMatch = raw.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) return [];
+    const parsed = JSON.parse(jsonMatch[0]) as Array<{
+      topic?: string;
+      count?: number;
+      examples?: string[];
+      inKnowledgeBase?: boolean;
+    }>;
+    return parsed
+      .filter((p) => p.topic && typeof p.count === "number")
+      .map((p) => ({
+        topic: p.topic!,
+        count: p.count!,
+        examples: Array.isArray(p.examples) ? p.examples.slice(0, 2).map(String) : [],
+        inKnowledgeBase: p.inKnowledgeBase === true,
+      }))
+      .sort((a, b) => b.count - a.count);
+  } catch (err) {
+    logger.error({ err }, "analyzeQuestionClusters: tahlil qilishda xatolik");
+    return [];
+  }
+}

@@ -217,7 +217,8 @@ export type AiFunctionName =
   | "answerLongRange"
   | "analyzeInsights"
   | "analyzeFeedback"
-  | "extractTextFromImage";
+  | "extractTextFromImage"
+  | "analyzeQuestionClusters";
 
 export interface UsageRecord {
   date: string;    // YYYY-MM-DD, Toshkent vaqti bo'yicha
@@ -227,6 +228,18 @@ export interface UsageRecord {
   cacheReadTokens: number;
   costUsd: number;
   timestamp: string; // ISO
+}
+
+// Mijoz savol berganda (genuine savol — sintetik/avtomatik matn emas) qayd
+// etiladi. /savollar buyrug'i shu jurnalni AI bilan tahlil qilib, eng ko'p
+// takrorlanadigan mavzularni topadi — bilim bazasini samarali to'ldirish uchun.
+export interface QuestionLogEntry {
+  id: string;
+  chatId: string;
+  question: string;
+  model: string | null;
+  timestamp: string;
+  wasAnsweredFromKB: boolean; // AI [NEED_ADMIN] belgisisiz javob berdimi
 }
 
 interface DbShape {
@@ -241,12 +254,13 @@ interface DbShape {
   settings: AppSettings;
   usage: UsageRecord[];
   apiBalance?: ApiBalance;
+  questionLog: QuestionLogEntry[];
 }
 
 function emptyDb(): DbShape {
   return {
     models: [], clients: [], samples: [], reports: {}, issues: [], modelMentions: [],
-    refundEvents: [], activityLog: [], settings: {}, usage: [],
+    refundEvents: [], activityLog: [], settings: {}, usage: [], questionLog: [],
   };
 }
 
@@ -274,6 +288,7 @@ function loadDb(): DbShape {
         settings: parsed.settings ?? {},
         usage: parsed.usage ?? [],
         apiBalance: parsed.apiBalance,
+        questionLog: parsed.questionLog ?? [],
       };
     } catch {
       return emptyDb();
@@ -513,5 +528,25 @@ export const usageStore = {
   },
   markCriticalAlertSent(): void {
     if (db.apiBalance) { db.apiBalance.criticalAlertSent = true; persist(); }
+  },
+};
+
+const QUESTION_LOG_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+export const questionLogStore = {
+  getAll(): QuestionLogEntry[] {
+    return db.questionLog;
+  },
+  getSince(sinceMs: number): QuestionLogEntry[] {
+    return db.questionLog.filter((q) => new Date(q.timestamp).getTime() >= sinceMs);
+  },
+  // Mijoz haqiqiy savol berganda chaqiriladi (sintetik/avtomatik matnlar
+  // uchun emas). Yozuv qo'shilganda 90 kundan eski yozuvlar ham tozalanadi —
+  // ma'lumot bazasi cheksiz o'smasin.
+  record(entry: Omit<QuestionLogEntry, "id" | "timestamp">): void {
+    const cutoff = Date.now() - QUESTION_LOG_RETENTION_MS;
+    db.questionLog = db.questionLog.filter((q) => new Date(q.timestamp).getTime() >= cutoff);
+    db.questionLog.push({ ...entry, id: randomUUID(), timestamp: new Date().toISOString() });
+    persist();
   },
 };
