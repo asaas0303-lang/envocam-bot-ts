@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import sharp from "sharp";
 import {
   REGIONS,
   usageStore,
@@ -17,21 +18,28 @@ const anthropic = new Anthropic({
   apiKey: process.env["ANTHROPIC_API_KEY"],
 });
 
-const MODEL = "claude-sonnet-5";
+// ─── Model tanlash: vazifaga qarab QIMMAT yoki ARZON model ─────────────────────
+//
+// Barcha AI vazifalari avval bitta qimmat modelda (Sonnet 5) ishlar edi —
+// hatto eng oddiy tasnif (intent, viloyat, til) ham. Endi ikkiga bo'lingan:
+// murakkab/sifat-muhim vazifalar SMART'da, oddiy tasnif ARZON'da qoladi.
+const MODEL_SMART = "claude-sonnet-5";
+const MODEL_CHEAP = "claude-haiku-4-5-20251001";
 
 // ─── Narx konfiguratsiyasi va xarajat kuzatuvi ─────────────────────────────────
 //
-// Manba: https://platform.claude.com/docs/en/about-claude/pricing (tekshirilgan: 2026-07-12)
+// Manba: https://platform.claude.com/docs/en/about-claude/pricing (tekshirilgan: 2026-07-15)
 // Claude Sonnet 5 — "introductory" narx, 2026-08-31 gacha amal qiladi:
-//   Input:  $2  / 1M token
-//   Output: $10 / 1M token
-//   Keshdan o'qish (cache hit): $0.20 / 1M token (bazaviy input narxining 0.1x)
-// 2026-09-01 dan boshlab standart narx: input $3, output $15 / 1M token —
-// shu sanadan keyin quyidagi qiymatlarni yangilash kerak.
-const MODEL_PRICING = {
-  inputPerMTok: 2,
-  outputPerMTok: 10,
-  cacheReadPerMTok: 0.2,
+//   Input $2 / Output $10 / Keshdan o'qish $0.20 / 1M token
+// Claude Haiku 4.5:
+//   Input $1 / Output $5 / Keshdan o'qish $0.10 / 1M token
+// MUHIM: Sonnet 5 hozir odatiy narxidan ancha arzon (introductory), shuning
+// uchun Haiku hozircha atigi 2x arzon — an'anaviy 10x+ farq emas. 2026-09-01
+// dan Sonnet 5 standart narxga ($3/$15) o'tadi, o'shanda Haiku ~3x arzon
+// bo'ladi — shu sanadan keyin quyidagi qiymatlarni yangilash kerak.
+const PRICING: Record<string, { inputPerMTok: number; outputPerMTok: number; cacheReadPerMTok: number }> = {
+  [MODEL_SMART]: { inputPerMTok: 2, outputPerMTok: 10, cacheReadPerMTok: 0.2 },
+  [MODEL_CHEAP]: { inputPerMTok: 1, outputPerMTok: 5, cacheReadPerMTok: 0.1 },
 };
 
 function tashkentDateStr(): string {
@@ -60,17 +68,18 @@ function checkBalanceThresholds(): void {
   }
 }
 
-function recordUsage(fn: AiFunctionName, usage: Anthropic.Usage): void {
+function recordUsage(fn: AiFunctionName, model: string, usage: Anthropic.Usage): void {
   // O'rnatilgan SDK (0.30.1) tipi hali "cache_read_input_tokens" maydonini
   // e'lon qilmaydi, lekin API javobida haqiqatda mavjud — shuning uchun
   // xavfsiz cast bilan o'qiymiz.
   const inputTokens = usage.input_tokens ?? 0;
   const outputTokens = usage.output_tokens ?? 0;
   const cacheReadTokens = (usage as { cache_read_input_tokens?: number }).cache_read_input_tokens ?? 0;
+  const pricing = PRICING[model] ?? PRICING[MODEL_SMART]!;
   const costUsd =
-    (inputTokens / 1_000_000) * MODEL_PRICING.inputPerMTok +
-    (outputTokens / 1_000_000) * MODEL_PRICING.outputPerMTok +
-    (cacheReadTokens / 1_000_000) * MODEL_PRICING.cacheReadPerMTok;
+    (inputTokens / 1_000_000) * pricing.inputPerMTok +
+    (outputTokens / 1_000_000) * pricing.outputPerMTok +
+    (cacheReadTokens / 1_000_000) * pricing.cacheReadPerMTok;
 
   usageStore.record({ date: tashkentDateStr(), fn, inputTokens, outputTokens, cacheReadTokens, costUsd });
   checkBalanceThresholds();
@@ -145,7 +154,7 @@ async function callClaude(
 ): Promise<Anthropic.Message> {
   try {
     let response = await anthropic.messages.create(params);
-    recordUsage(fn, response.usage);
+    recordUsage(fn, params.model, response.usage);
 
     if (extractText(response) === "") {
       logger.error(
@@ -153,7 +162,7 @@ async function callClaude(
         "callClaude: javobda matn bloki yo'q — qayta urinilyapti"
       );
       response = await anthropic.messages.create(params);
-      recordUsage(fn, response.usage);
+      recordUsage(fn, params.model, response.usage);
       if (extractText(response) === "") {
         logger.error(
           { fn, stopReason: response.stop_reason, content: JSON.stringify(response.content).slice(0, 500) },
@@ -216,7 +225,7 @@ export async function readBarcodeDigits(
     : `Bu rasmda kamera qutisidagi barcode raqamining OXIRGI 4 ta raqami bo'lishi mumkin — ular odatda qolgan raqamlarga qaraganda KATTAROQ va QALINROQ shriftda, alohida ajratib yozilgan bo'ladi. Faqat shu 4 ta raqamni yoz, boshqa hech narsa yozma. Aniq topolmasang faqat "null" deb yoz.`;
 
   const response = await callClaude("readBarcodeDigits", {
-    model: MODEL,
+    model: MODEL_SMART,
     max_tokens: 32,
     messages: [
       {
@@ -247,7 +256,7 @@ export async function classifySurveyReply(
 ): Promise<"survey_answer" | "other"> {
   try {
     const response = await callClaude("classifySurveyReply", {
-      model: MODEL,
+      model: MODEL_CHEAP,
       max_tokens: 32,
       messages: [
         {
@@ -285,7 +294,7 @@ export async function classifyLongRangeAnswer(
 ): Promise<"start_over" | "already_added" | "unclear"> {
   try {
     const response = await callClaude("classifyLongRangeAnswer", {
-      model: MODEL,
+      model: MODEL_CHEAP,
       max_tokens: 24,
       messages: [
         {
@@ -323,7 +332,7 @@ Faqat JSON: {"kind":"start_over|already_added|unclear"}`,
 export async function classifyVideoRequest(text: string): Promise<boolean> {
   try {
     const response = await callClaude("classifyVideoRequest", {
-      model: MODEL,
+      model: MODEL_CHEAP,
       max_tokens: 16,
       messages: [
         {
@@ -398,10 +407,10 @@ ${guideBlock}`;
   const finalSystemPrompt = systemPrompt + buildStoreRules(isUz);
 
   const response = await callClaude("answerLongRange", {
-    model: MODEL,
+    model: MODEL_SMART,
     max_tokens: 700,
     system: finalSystemPrompt,
-    messages: buildMessages(history.slice(-16), question),
+    messages: buildMessages(history.slice(-10), question),
   });
 
   return extractText(response);
@@ -466,7 +475,7 @@ Faqat JSON qaytar: {"status": "matched|unclear|no_match", "model": "nom yoki nul
   });
 
   const response = await callClaude("identifyModelFromImages", {
-    model: MODEL,
+    model: MODEL_SMART,
     max_tokens: 256,
     messages: [{ role: "user", content }],
   });
@@ -488,19 +497,38 @@ export interface ImageClassification {
   description: string;
 }
 
+// Faqat rasm TURINI aniqlash uchun to'liq o'lcham kerak emas — kichraytirib
+// token sonini kamaytiramiz. MUHIM: bu faqat classifyImage uchun ishlatiladi,
+// barcode.ts'ning o'z rasm-yaxshilash quvuri (enhanceForOcr) ASL o'lchamdagi
+// rasm bilan ishlaydi — aks holda barcode o'qish aniqligi pasayardi.
+async function shrinkForClassification(image: ImageInput): Promise<ImageInput> {
+  try {
+    const buffer = Buffer.from(image.base64, "base64");
+    const resized = await sharp(buffer)
+      .resize({ width: 1024, withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+    return { base64: resized.toString("base64"), mimeType: "image/jpeg" };
+  } catch (err) {
+    logger.error({ err }, "shrinkForClassification: rasmni kichraytirishda xatolik, asl rasm ishlatiladi");
+    return image;
+  }
+}
+
 // Mijoz kamera/quti o'rniga ko'pincha ilova skrinshoti yoki qo'llanma
 // varag'ini yuboradi — bularni model-aniqlashga tiqishtirish behuda va
 // chalkash javobga olib keladi. Shu funksiya bilan avval rasm turini
 // bilib olamiz.
 export async function classifyImage(image: ImageInput): Promise<ImageClassification> {
+  const small = await shrinkForClassification(image);
   const response = await callClaude("classifyImage", {
-    model: MODEL,
+    model: MODEL_CHEAP,
     max_tokens: 128,
     messages: [
       {
         role: "user",
         content: [
-          toImageBlock(image),
+          toImageBlock(small),
           {
             type: "text",
             text: `Bu rasmda aynan nima ko'rinayotganini aniqla.
@@ -541,9 +569,32 @@ export interface IntentResult {
   productFeedback: string | null;
 }
 
+// Bir xil matn qisqa vaqt ichida qayta kelsa (masalan mijoz nusxa-joylashtirib
+// takrorlasa yoki xatolik retry qilinsa), qayta AI chaqirmasdan natijani
+// keshdan qaytaramiz. Kichik, chegaralangan xotira kesh (o'lcham cheksiz o'smaydi).
+const detectIntentCache = new Map<string, { result: IntentResult; expiresAt: number }>();
+const DETECT_INTENT_CACHE_TTL_MS = 3 * 60 * 1000;
+
 export async function detectIntent(text: string): Promise<IntentResult> {
+  const cacheKey = text.trim().toLowerCase();
+  const cached = detectIntentCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.result;
+
+  const result = await detectIntentUncached(text);
+
+  if (detectIntentCache.size > 200) {
+    const now = Date.now();
+    for (const [k, v] of detectIntentCache) {
+      if (v.expiresAt <= now) detectIntentCache.delete(k);
+    }
+  }
+  detectIntentCache.set(cacheKey, { result, expiresAt: Date.now() + DETECT_INTENT_CACHE_TTL_MS });
+  return result;
+}
+
+async function detectIntentUncached(text: string): Promise<IntentResult> {
   const response = await callClaude("detectIntent", {
-    model: MODEL,
+    model: MODEL_CHEAP,
     max_tokens: 128,
     messages: [
       {
@@ -610,7 +661,7 @@ export async function classifyProductFeedback(
   existingLabels: string[]
 ): Promise<string | null> {
   const response = await callClaude("classifyProductFeedback", {
-    model: MODEL,
+    model: MODEL_CHEAP,
     max_tokens: 64,
     messages: [
       {
@@ -643,7 +694,7 @@ Faqat JSON qaytar: {"label": "kategoriya nomi"}`,
 
 export async function classifyRegion(text: string): Promise<Region | null> {
   const response = await callClaude("classifyRegion", {
-    model: MODEL,
+    model: MODEL_CHEAP,
     max_tokens: 64,
     messages: [
       {
@@ -678,7 +729,7 @@ export async function extractTextFromImage(
   mimeType: string
 ): Promise<string> {
   const response = await callClaude("extractTextFromImage", {
-    model: MODEL,
+    model: MODEL_SMART,
     max_tokens: 2048,
     messages: [
       {
@@ -730,6 +781,7 @@ export interface AnswerOptions {
 
 export async function answerQuestion(opts: AnswerOptions): Promise<string> {
   const { question, language, cameraModel, connectionMethod, refundRequested, firstName, shouldGreet, history, samples } = opts;
+  const isUz = language === "uz" || language === "uz-cyrl";
 
   // ─ Bilim bazasi ─
   const knowledgeBase: string[] = [];
@@ -770,8 +822,6 @@ export async function answerQuestion(opts: AnswerOptions): Promise<string> {
   const faqBlock = buildFaqBlock(cameraModel?.faqItems);
   if (faqBlock) knowledgeBase.push(faqBlock);
 
-  const isUz = language === "uz" || language === "uz-cyrl";
-
   // ─ Salomlashish ko'rsatmasi ─
   let greetingNote = "";
   if (shouldGreet && firstName) {
@@ -807,51 +857,6 @@ export async function answerQuestion(opts: AnswerOptions): Promise<string> {
       : "\nВАЖНО — ПОЛИТИКА ВОЗВРАТА: Клиент попросил вернуть деньги или товар (в этом или предыдущем сообщении). НИКОГДА не соглашайся на возврат и не обещай его — это электроника, возврат невозможен ни при каких условиях. Но говори об этом ВСЕГДА тепло, с пониманием и извинением, не грубо и не холодно. Внимательно выслушай проблему и предложи решить её вместе (например, ещё раз пройти шаги настройки).")
     : "";
 
-  // ─ System prompt ─
-  const systemPrompt = isUz
-    ? `Sen EnvoCam kamera do'konining do'stona va samimiy yordamchisisan.
-
-QOIDALAR:
-- Hech qachon emoji ishlatma
-- Inson kabi gapir: issiq, muloyim, samimiy ohangda — xuddi yaxshi tanish odam kabi
-- Rasmiy emas, lekin hurmatli bo'l
-- Har bir fikr 1-2 jumladan oshmasin
-- Bir nechta fikr bo'lsa ### bilan ajrat (har biri alohida xabar yuboriladi)
-- ${greetingNote}
-- Mijoz savollariga aniq va amaliy javob ber
-- Bilmasang — qo'shimcha ma'lumot so'ra yoki ekran tasvirini tavsiya et
-${cameraModel ? `\nKamera modeli: ${cameraModel.name}` : "\nKamera modeli hali aniqlanmagan."}
-${knowledgeBase.length > 0
-      ? "\nSaqlangan ma'lumotlar (faqat shu ma'lumotlarga tayanibing):\n" + knowledgeBase.join("\n\n")
-      : cameraModel
-        ? "\nBu kamera uchun hali batafsil ma'lumot yuklanmagan. Umumiy kamera bilimingdan yordam ber."
-        : "\nHozircha kamera aniqlanmagan. Umumiy yordam ber va kamera rasmini so'ra."}
-${connectionMethodNote}
-${refundNote}
-${samples.length > 0
-      ? "\n\n=== Namuna yozishmalar (shu uslubda gapir) ===\n" + samples.join("\n\n---\n\n")
-      : ""}`
-    : `Ты дружелюбный помощник магазина камер EnvoCam.
-
-ПРАВИЛА:
-- Никогда не используй эмодзи
-- Говори по-человечески: тепло, мягко, искренне
-- Не официально, но уважительно
-- Каждая мысль — не более 1-2 предложений
-- Если мыслей несколько — разделяй через ### (каждая часть — отдельное сообщение)
-- ${greetingNote}
-- Отвечай конкретно и практично
-- Если не знаешь — попроси уточнение
-${cameraModel ? `\nМодель камеры: ${cameraModel.name}` : "\nМодель камеры ещё не определена."}
-${knowledgeBase.length > 0
-      ? "\nСохранённые данные:\n" + knowledgeBase.join("\n\n")
-      : "\nПодробных данных пока нет. Помогай на основе общих знаний."}
-${connectionMethodNote}
-${refundNote}
-${samples.length > 0
-      ? "\n\n=== Примеры общения (придерживайся этого стиля) ===\n" + samples.join("\n\n---\n\n")
-      : ""}`;
-
   const rephraseNote = opts.rephraseHint
     ? (isUz
       ? `\n\nMUHIM: Mijoz oldingi javobingizni TUSHUNMADI. Ayni shu narsani BOSHQACHA, ANCHA SODDAROQ so'zlar bilan, boshqa misol yoki boshqa yo'l bilan tushuntir. Oldingi javobingdagi bir xil jumlalarni TAKRORLAMA.`
@@ -872,17 +877,82 @@ ${samples.length > 0
     }
   }
 
-  const storeRules = buildStoreRules(isUz);
+  const cyrillicNote = language === "uz-cyrl"
+    ? `\n\nMUHIM: Mijoz sizga kirill yozuvida yozmoqda. Javobingizni FAQAT kirill yozuvida yozing (lotin emas) — masalan "Assalomu alaykum" emas "Ассалому алайкум", "Rahmat" emas "Раҳмат" deb yozing.`
+    : "";
 
-  const finalSystemPrompt = (language === "uz-cyrl"
-    ? systemPrompt + `\n\nMUHIM: Mijoz sizga kirill yozuvida yozmoqda. Javobingizni FAQAT kirill yozuvida yozing (lotin emas) — masalan "Assalomu alaykum" emas "Ассалому алайкум", "Rahmat" emas "Раҳмат" deb yozing.`
-    : systemPrompt) + `\n\n${SHORTHAND_UZ_NOTE}` + contentNote + storeRules + rephraseNote;
+  // ─ BLOK A (KESHLANADI): asosiy shaxsiyat qoidalari + namuna yozishmalar +
+  // qisqartma eslatma + do'kon qoidalari. Bu BARCHA mijozlar/modellar uchun
+  // deyarli bir xil (faqat til bo'yicha 2 variant) — shuning uchun eng katta
+  // tejamkorlik ANIQ shu blokdan keladi: keshdan o'qish bazaviy narxning 0.1x'i.
+  const rulesBlock = isUz
+    ? `Sen EnvoCam kamera do'konining do'stona va samimiy yordamchisisan.
+
+QOIDALAR:
+- Hech qachon emoji ishlatma
+- Inson kabi gapir: issiq, muloyim, samimiy ohangda — xuddi yaxshi tanish odam kabi
+- Rasmiy emas, lekin hurmatli bo'l
+- Har bir fikr 1-2 jumladan oshmasin
+- Bir nechta fikr bo'lsa ### bilan ajrat (har biri alohida xabar yuboriladi)
+- Mijoz savollariga aniq va amaliy javob ber
+- Bilmasang — qo'shimcha ma'lumot so'ra yoki ekran tasvirini tavsiya et`
+    : `Ты дружелюбный помощник магазина камер EnvoCam.
+
+ПРАВИЛА:
+- Никогда не используй эмодзи
+- Говори по-человечески: тепло, мягко, искренне
+- Не официально, но уважительно
+- Каждая мысль — не более 1-2 предложений
+- Если мыслей несколько — разделяй через ### (каждая часть — отдельное сообщение)
+- Отвечай конкретно и практично
+- Если не знаешь — попроси уточнение`;
+
+  const samplesBlock = samples.length > 0
+    ? (isUz
+      ? "\n\n=== Namuna yozishmalar (shu uslubda gapir) ===\n" + samples.join("\n\n---\n\n")
+      : "\n\n=== Примеры общения (придерживайся этого стиля) ===\n" + samples.join("\n\n---\n\n"))
+    : "";
+
+  const stableBlockText = rulesBlock + samplesBlock + `\n\n${SHORTHAND_UZ_NOTE}` + buildStoreRules(isUz);
+
+  // ─ BLOK B (KESHLANMAYDI — har xabarda o'zgaradi): model/bilim bazasi,
+  // salomlashish, ulash usuli, qaytarish siyosati, mavjud kontent, kirillcha,
+  // qayta tushuntirish.
+  const modelLabel = cameraModel
+    ? (isUz ? `\nKamera modeli: ${cameraModel.name}` : `\nМодель камеры: ${cameraModel.name}`)
+    : (isUz ? "\nKamera modeli hali aniqlanmagan." : "\nМодель камеры ещё не определена.");
+  const knowledgeText = knowledgeBase.length > 0
+    ? (isUz ? "\nSaqlangan ma'lumotlar (faqat shu ma'lumotlarga tayanibing):\n" : "\nСохранённые данные:\n") + knowledgeBase.join("\n\n")
+    : cameraModel
+      ? (isUz ? "\nBu kamera uchun hali batafsil ma'lumot yuklanmagan. Umumiy kamera bilimingdan yordam ber." : "\nПодробных данных пока нет. Помогай на основе общих знаний.")
+      : (isUz ? "\nHozircha kamera aniqlanmagan. Umumiy yordam ber va kamera rasmini so'ra." : "\nПодробных данных пока нет. Помогай на основе общих знаний.");
+
+  const dynamicBlockText =
+    `\n${greetingNote}` +
+    modelLabel +
+    knowledgeText +
+    connectionMethodNote +
+    refundNote +
+    contentNote +
+    cyrillicNote +
+    rephraseNote;
+
+  // Anthropic prompt caching: o'rnatilgan SDK (0.30.1) TextBlockParam turi
+  // hali cache_control maydonini e'lon qilmaydi (bu funksiya keyinroq
+  // qo'shilgan), lekin haqiqiy API buni standart /v1/messages orqali qabul
+  // qiladi — xuddi cache_read_input_tokens kabi xavfsiz kengaytirilgan tur
+  // bilan ishlatamiz. Faqat BLOK A keshlanadi (cache_control bilan
+  // belgilangan oxirgi blokgacha bo'lgan hamma narsa kesh sifatida saqlanadi).
+  const systemBlocks = [
+    { type: "text", text: stableBlockText, cache_control: { type: "ephemeral" } },
+    { type: "text", text: dynamicBlockText },
+  ] as unknown as Anthropic.TextBlockParam[];
 
   const response = await callClaude("answerQuestion", {
-    model: MODEL,
+    model: MODEL_SMART,
     max_tokens: 1024,
-    system: finalSystemPrompt,
-    messages: buildMessages(history.slice(-16), question),
+    system: systemBlocks,
+    messages: buildMessages(history.slice(-10), question),
   });
 
   return extractText(response);
@@ -915,7 +985,7 @@ export async function analyzeInsights(
     .join("\n");
 
   const response = await callClaude("analyzeInsights", {
-    model: MODEL,
+    model: MODEL_SMART,
     max_tokens: 2048,
     messages: [
       {
@@ -976,7 +1046,7 @@ export async function analyzeFeedback(
   const dateStr = now.toISOString().slice(0, 10);
 
   const response = await callClaude("analyzeFeedback", {
-    model: MODEL,
+    model: MODEL_SMART,
     max_tokens: 2048,
     messages: [
       {
@@ -1027,7 +1097,7 @@ export async function analyzeQuestionClusters(
 
   try {
     const response = await callClaude("analyzeQuestionClusters", {
-      model: MODEL,
+      model: MODEL_SMART,
       max_tokens: 4096,
       messages: [
         {
