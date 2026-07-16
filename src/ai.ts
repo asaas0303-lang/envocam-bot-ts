@@ -11,7 +11,7 @@ import {
   type MessageRecord,
   type Region,
 } from "./data/store.js";
-import { notifyAdmins } from "./helpers.js";
+import { notifyAdmins, isMeaninglessAnswer } from "./helpers.js";
 import { logger } from "./lib/logger.js";
 
 const anthropic = new Anthropic({
@@ -973,6 +973,20 @@ export async function analyzeInsights(
 ): Promise<string> {
   if (feedbacks.length === 0) return "Hali so'rovnoma ma'lumotlari to'planmagan.";
 
+  // Mijozlar ko'pincha "-", ".", "hammasi zo'r" kabi mazmunsiz javob beradi —
+  // agar HAMMASI shunday bo'lsa, AI'ga bo'sh ma'lumot yuborib vaqt/pul
+  // sarflamaymiz, mijozga to'g'ridan-to'g'ri tushunarli xabar beramiz.
+  const meaningfulCount = feedbacks.filter((f) =>
+    !isMeaninglessAnswer(f.satisfaction) ||
+    !isMeaninglessAnswer(f.wishlist) ||
+    !isMeaninglessAnswer(f.location) ||
+    !isMeaninglessAnswer(f.purpose)
+  ).length;
+
+  if (meaningfulCount === 0) {
+    return `Yig'ilgan ${feedbacks.length} ta so'rovnoma javobi mazmunli emas (mijozlar asosan "-", "ha", "hammasi zo'r" kabi qisqa javob berishgan) — tahlil qilish uchun yetarli ma'lumot yo'q.`;
+  }
+
   const data = feedbacks
     .map(
       (f, i) =>
@@ -984,13 +998,14 @@ export async function analyzeInsights(
     )
     .join("\n");
 
-  const response = await callClaude("analyzeInsights", {
-    model: MODEL_SMART,
-    max_tokens: 2048,
-    messages: [
-      {
-        role: "user",
-        content: `Quyida ${feedbacks.length} ta mijozdan to'plangan ma'lumotlar bor. Tahlil qil:
+  try {
+    const response = await callClaude("analyzeInsights", {
+      model: MODEL_SMART,
+      max_tokens: 2048,
+      messages: [
+        {
+          role: "user",
+          content: `Quyida ${feedbacks.length} ta mijozdan to'plangan ma'lumotlar bor. Tahlil qil:
 
 VAZIFA:
 1. Muammolar reytingi: har bir muammo/shikoyatni aniqlash, nechta odam buni aytganini hisoblash, foizini ko'rsat. Eng ko'p aytilgan muammo YUQORIDA tursin.
@@ -1018,11 +1033,20 @@ Foydalanish maqsadlari:
 
 MA'LUMOTLAR:
 ${data}`,
-      },
-    ],
-  });
+        },
+      ],
+    });
 
-  return extractText(response) || "Tahlil qilishda xatolik yuz berdi.";
+    const text = extractText(response);
+    if (!text) {
+      logger.error({ feedbackCount: feedbacks.length }, "analyzeInsights: AI bo'sh javob qaytardi (2 urinishdan keyin ham)");
+      return "AI tahlil bo'sh javob qaytardi. Birozdan so'ng qayta urinib ko'ring (\"Qayta tahlil\" tugmasi).";
+    }
+    return text;
+  } catch (err) {
+    logger.error({ err, feedbackCount: feedbacks.length }, "analyzeInsights: AI chaqiruvida xatolik");
+    return `Tahlil qilishda xatolik yuz berdi: ${err instanceof Error ? err.message : String(err)}`;
+  }
 }
 
 // ─── Feedback tahlili (haftalik hisobot) ──────────────────────────────────────
@@ -1030,6 +1054,20 @@ ${data}`,
 export async function analyzeFeedback(
   feedbacks: Array<ClientFeedback & { modelName: string }>
 ): Promise<string> {
+  if (feedbacks.length === 0) return "Hali fikr-mulohaza to'planmagan.";
+
+  const meaningfulCount = feedbacks.filter((f) =>
+    !isMeaninglessAnswer(f.satisfaction) ||
+    !isMeaninglessAnswer(f.wishlist) ||
+    !isMeaninglessAnswer(f.location) ||
+    !isMeaninglessAnswer(f.purpose) ||
+    !isMeaninglessAnswer(f.budget)
+  ).length;
+
+  if (meaningfulCount === 0) {
+    return `Yig'ilgan ${feedbacks.length} ta fikr-mulohaza mazmunli emas (mijozlar asosan qisqa/bo'sh javob berishgan) — hisobot tuzish uchun yetarli ma'lumot yo'q.`;
+  }
+
   const data = feedbacks
     .map(
       (f, i) =>
@@ -1045,13 +1083,14 @@ export async function analyzeFeedback(
   const now = new Date(Date.now() + 5 * 60 * 60 * 1000);
   const dateStr = now.toISOString().slice(0, 10);
 
-  const response = await callClaude("analyzeFeedback", {
-    model: MODEL_SMART,
-    max_tokens: 2048,
-    messages: [
-      {
-        role: "user",
-        content: `Quyida ${feedbacks.length} ta mijozdan to'plangan kamera bo'yicha fikr-mulohazalar bor. Tahlil qil va do'kon egasiga amaliy haftalik hisobot yoz.
+  try {
+    const response = await callClaude("analyzeFeedback", {
+      model: MODEL_SMART,
+      max_tokens: 2048,
+      messages: [
+        {
+          role: "user",
+          content: `Quyida ${feedbacks.length} ta mijozdan to'plangan kamera bo'yicha fikr-mulohazalar bor. Tahlil qil va do'kon egasiga amaliy haftalik hisobot yoz.
 
 Hisobotda bo'lsin:
 1. Eng ko'p uchragan kamchiliklar (kamera modeli bo'yicha guruhlab)
@@ -1067,11 +1106,20 @@ Ma'lumotlar:
 ${data}
 
 Hisobot o'zbek tilida, aniq va amaliy bo'lsin. Emoji ishlatma. Boshida "Haftalik hisobot — ${dateStr}" deb yoz.`,
-      },
-    ],
-  });
+        },
+      ],
+    });
 
-  return extractText(response) || "Tahlil qilishda xatolik yuz berdi.";
+    const text = extractText(response);
+    if (!text) {
+      logger.error({ feedbackCount: feedbacks.length }, "analyzeFeedback: AI bo'sh javob qaytardi (2 urinishdan keyin ham)");
+      return "AI hisobot tuzishda bo'sh javob qaytardi. Birozdan so'ng qayta urinib ko'ring.";
+    }
+    return text;
+  } catch (err) {
+    logger.error({ err, feedbackCount: feedbacks.length }, "analyzeFeedback: AI chaqiruvida xatolik");
+    return `Hisobot tuzishda xatolik yuz berdi: ${err instanceof Error ? err.message : String(err)}`;
+  }
 }
 
 // ─── Mijoz savollarini mavzuga ko'ra guruhlash (/savollar buyrug'i) ───────────
@@ -1083,26 +1131,57 @@ export interface QuestionCluster {
   inKnowledgeBase: boolean;
 }
 
-// questionLogStore'dan yig'ilgan xom savol matnlarini MA'NOSIGA ko'ra
-// guruhlaydi (imlo/til/xato farqiga qaramay) va har bir guruhni mavjud FAQ
-// ro'yxati bilan solishtirib, bilim bazasida bor-yo'qligini aniqlaydi.
-export async function analyzeQuestionClusters(
-  questions: string[],
+// Savol matnini taqqoslash uchun soddalashtiradi — kirill/lotin, katta/kichik
+// harf, tinish belgilari va ortiqcha bo'shliqlarga qaramay bir xil savollarni
+// aynan bir xil deb tanish uchun.
+function normalizeQuestionText(q: string): string {
+  return q
+    .toLowerCase()
+    .replace(/[’ʻʼ`]/g, "'")
+    .replace(/[?!.,;:]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// AI javobi kesilib qolgan (max_tokens tugagan) taqdirda ham JSON massivni
+// to'liq parse qilishga urinmaymiz — har bir tugallangan {...} obyektini
+// alohida ajratib olamiz, oxirgi (kesilgan) obyekt shunchaki e'tiborsiz qoladi.
+function extractJsonObjects(raw: string): Array<Record<string, unknown>> {
+  const matches = raw.match(/\{[^{}]*\}/g) || [];
+  const out: Array<Record<string, unknown>> = [];
+  for (const m of matches) {
+    try {
+      out.push(JSON.parse(m) as Record<string, unknown>);
+    } catch {
+      // kesilgan yoki noto'g'ri obyekt — o'tkazib yuboramiz
+    }
+  }
+  return out;
+}
+
+// Bitta AI chaqiruviga yuboriladigan noyob savollar soni chegarasi — bundan
+// ko'p bo'lsa, bir nechta bo'lakka (batch) bo'lib yuboramiz, aks holda AI
+// javobi max_tokens'dan oshib, JSON kesilib qolishi mumkin.
+export const QUESTION_CLUSTER_BATCH_SIZE = 50;
+
+async function clusterQuestionBatch(
+  entries: Array<{ text: string; count: number }>,
   existingFaqQuestions: string[]
 ): Promise<QuestionCluster[]> {
-  const questionsList = questions.map((q, i) => `${i + 1}. ${q}`).join("\n");
+  const questionsList = entries
+    .map((e, i) => `${i + 1}. (${e.count}x so'ralgan) ${e.text}`)
+    .join("\n");
   const faqList = existingFaqQuestions.length > 0
     ? existingFaqQuestions.map((q) => `- ${q}`).join("\n")
     : "(hali FAQ yo'q)";
 
-  try {
-    const response = await callClaude("analyzeQuestionClusters", {
-      model: MODEL_SMART,
-      max_tokens: 4096,
-      messages: [
-        {
-          role: "user",
-          content: `Quyida mijozlar so'ragan ${questions.length} ta savol matni bor (turli imlo, til, xato bilan yozilgan bo'lishi mumkin):
+  const response = await callClaude("analyzeQuestionClusters", {
+    model: MODEL_SMART,
+    max_tokens: 8192,
+    messages: [
+      {
+        role: "user",
+        content: `Quyida mijozlar so'ragan ${entries.length} ta noyob savol matni bor (turli imlo, til, xato bilan yozilgan bo'lishi mumkin). Har bir savol oldida qavs ichida shu savol necha marta so'ralgani (xN) ko'rsatilgan:
 
 ${questionsList}
 
@@ -1111,36 +1190,93 @@ ${faqList}
 
 VAZIFA:
 1. Yuqoridagi mijoz savollarini MA'NOSIGA ko'ra guruhla — bir xil mavzudagi savollarni (turli so'z, imlo xatosi, kirill/lotin farqiga qaramay) BITTA guruhga birlashtir.
-2. Har bir guruh uchun: qisqa umumiy mavzu nomi (2-5 so'z, o'zbek tilida), nechta marta so'ralgani, 1-2 ta aniq misol matn (asl matndan, o'zgartirmasdan).
-3. Har bir guruh uchun, yuqoridagi FAQ ro'yxati bilan solishtirib, shu mavzu FAQ'da ALLAQACHON qamrab olingan-olinmaganini aniqla (inKnowledgeBase: true agar mavzu FAQ'dagi biror savolga mos kelsa, aks holda false).
-4. Eng ko'p so'ralgan guruhdan kamigacha tartibla.
+2. Har bir guruh uchun umumiy count — guruhga kirgan savollarning (xN) sonlarini QO'SHIB hisobla (savol matnini emas, balki oldidagi sonni qo'sh).
+3. Har bir guruh uchun: qisqa umumiy mavzu nomi (2-5 so'z, o'zbek tilida), 1-2 ta aniq misol matn (asl matndan, o'zgartirmasdan).
+4. Har bir guruh uchun, yuqoridagi FAQ ro'yxati bilan solishtirib, shu mavzu FAQ'da ALLAQACHON qamrab olingan-olinmaganini aniqla (inKnowledgeBase: true agar mavzu FAQ'dagi biror savolga mos kelsa, aks holda false).
+5. Eng ko'p so'ralgan guruhdan kamigacha tartibla.
 
 Faqat JSON massiv qaytar, boshqa hech narsa yozma:
 [{"topic": "...", "count": N, "examples": ["...", "..."], "inKnowledgeBase": true|false}, ...]`,
-        },
-      ],
-    });
+      },
+    ],
+  });
 
-    const raw = extractText(response);
-    const jsonMatch = raw.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) return [];
-    const parsed = JSON.parse(jsonMatch[0]) as Array<{
-      topic?: string;
-      count?: number;
-      examples?: string[];
-      inKnowledgeBase?: boolean;
-    }>;
-    return parsed
-      .filter((p) => p.topic && typeof p.count === "number")
-      .map((p) => ({
-        topic: p.topic!,
-        count: p.count!,
-        examples: Array.isArray(p.examples) ? p.examples.slice(0, 2).map(String) : [],
-        inKnowledgeBase: p.inKnowledgeBase === true,
-      }))
-      .sort((a, b) => b.count - a.count);
+  const raw = extractText(response);
+  const objects = extractJsonObjects(raw);
+  if (objects.length === 0) {
+    logger.error(
+      { rawPreview: raw.slice(0, 500), entryCount: entries.length },
+      "analyzeQuestionClusters: batch javobidan bironta ham JSON obyekt topilmadi"
+    );
+    return [];
+  }
+  return objects
+    .filter((p) => typeof p["topic"] === "string" && typeof p["count"] === "number")
+    .map((p) => ({
+      topic: p["topic"] as string,
+      count: p["count"] as number,
+      examples: Array.isArray(p["examples"]) ? (p["examples"] as unknown[]).slice(0, 2).map(String) : [],
+      inKnowledgeBase: p["inKnowledgeBase"] === true,
+    }));
+}
+
+// questionLogStore'dan yig'ilgan xom savol matnlarini MA'NOSIGA ko'ra
+// guruhlaydi (imlo/til/xato farqiga qaramay) va har bir guruhni mavjud FAQ
+// ro'yxati bilan solishtirib, bilim bazasida bor-yo'qligini aniqlaydi.
+// Katta hajmdagi savollarda AI javobi max_tokens'dan oshib JSON kesilib
+// qolmasligi uchun: (1) aynan bir xil savollarni oldindan birlashtiramiz
+// (dedupe), (2) noyob savollar ko'p bo'lsa bir nechta bo'lakka bo'lib
+// yuboramiz va natijalarni mavzu nomi bo'yicha birlashtiramiz.
+export async function analyzeQuestionClusters(
+  questions: string[],
+  existingFaqQuestions: string[]
+): Promise<QuestionCluster[]> {
+  if (questions.length === 0) return [];
+
+  const dedupMap = new Map<string, { text: string; count: number }>();
+  for (const q of questions) {
+    const key = normalizeQuestionText(q);
+    if (!key) continue;
+    const existing = dedupMap.get(key);
+    if (existing) existing.count += 1;
+    else dedupMap.set(key, { text: q, count: 1 });
+  }
+  const uniqueEntries = Array.from(dedupMap.values()).sort((a, b) => b.count - a.count);
+
+  const batches: Array<Array<{ text: string; count: number }>> = [];
+  for (let i = 0; i < uniqueEntries.length; i += QUESTION_CLUSTER_BATCH_SIZE) {
+    batches.push(uniqueEntries.slice(i, i + QUESTION_CLUSTER_BATCH_SIZE));
+  }
+
+  try {
+    const batchResults = await Promise.all(
+      batches.map((batch) => clusterQuestionBatch(batch, existingFaqQuestions))
+    );
+
+    // Turli bo'laklardan kelgan bir xil mavzuli guruhlarni birlashtiramiz
+    // (mavzu nomi kichik harfda solishtiriladi).
+    const merged = new Map<string, QuestionCluster>();
+    for (const clusters of batchResults) {
+      for (const c of clusters) {
+        const key = c.topic.trim().toLowerCase();
+        const existing = merged.get(key);
+        if (existing) {
+          existing.count += c.count;
+          existing.inKnowledgeBase = existing.inKnowledgeBase || c.inKnowledgeBase;
+          for (const ex of c.examples) {
+            if (existing.examples.length < 2 && !existing.examples.includes(ex)) {
+              existing.examples.push(ex);
+            }
+          }
+        } else {
+          merged.set(key, { ...c, examples: [...c.examples] });
+        }
+      }
+    }
+
+    return Array.from(merged.values()).sort((a, b) => b.count - a.count);
   } catch (err) {
-    logger.error({ err }, "analyzeQuestionClusters: tahlil qilishda xatolik");
+    logger.error({ err, questionCount: questions.length }, "analyzeQuestionClusters: tahlil qilishda xatolik");
     return [];
   }
 }

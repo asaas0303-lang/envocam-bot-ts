@@ -16,6 +16,29 @@ export function detectLanguage(text: string): "uz" | "uz-cyrl" | "ru" {
   return "uz";
 }
 
+// So'rovnoma javoblarida ko'p uchraydigan "hech narsa aytmaydigan" javoblar
+// — bo'sh, tinish belgisi, yoki mazmunsiz qisqa iboralar. Faqat AYNAN
+// bunday holatlarni ushlaydi — "ha"/"yo'q" kabi haqiqiy qisqa so'zlarni
+// (masalan Ha/Yo'q/Qisman savoliga javob bo'lsa) MEANINGLESS deb belgilamaydi,
+// faqat ma'lum ro'yxatdagi haqiqatan bo'sh iboralarni.
+const MEANINGLESS_ANSWER_PHRASES = new Set([
+  "-", ".", "..", "...", "ha", "yoq", "yo'q", "yaxshi", "zor", "zo'r",
+  "hammasi zor", "hammasi zo'r", "hammasi yaxshi", "menga farqi yoq",
+  "menga farqi yo'q", "bilmayman", "bilmadim", "yoq gap", "yo'q gap",
+]);
+const MEANINGLESS_PUNCT_ONLY_RE = /^[\s.\-_,!?…]+$/;
+
+export function isMeaninglessAnswer(text: string | undefined): boolean {
+  if (!text) return true;
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return true;
+  if (trimmed.length <= 2) return true;
+  if (MEANINGLESS_PUNCT_ONLY_RE.test(trimmed)) return true;
+  const normalized = trimmed.toLowerCase().replace(/[’ʻʼ`]/g, "'");
+  if (MEANINGLESS_ANSWER_PHRASES.has(normalized)) return true;
+  return false;
+}
+
 export function getAdminIds(): string[] {
   const raw = process.env["ADMIN_IDS"] || "";
   return raw

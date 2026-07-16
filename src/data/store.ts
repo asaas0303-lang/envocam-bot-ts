@@ -161,6 +161,10 @@ export interface ClientData {
   // lekin mijoz YORDAMSIZ qolmasligi kerak. Shu holatda kod umumiy (global)
   // yo'riqnoma/video/reset ko'rsatmalarini fallback sifatida ishlatadi.
   unknownModel?: boolean;
+  // Model qanday usulda aniqlangani — statistikada barcode aniqlash
+  // sifatini kuzatish uchun ("aniq mos" / "fuzzy (1 xato bilan)" / "mijoz
+  // qo'lda model nomini yozdi" / "barcode o'qildi-yu bazada topilmadi").
+  modelMatchMethod?: "exact" | "fuzzy" | "manual" | "unknown";
   refundRequested?: boolean;
   unsupportedMessageNoted?: boolean;
   lastInteractionDate?: string;

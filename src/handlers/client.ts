@@ -22,6 +22,7 @@ import {
   randomDelay,
   sendSplitMessages,
   sleep,
+  isMeaninglessAnswer,
 } from "../helpers.js";
 import {
   detectIntent,
@@ -1290,6 +1291,7 @@ async function handleUnknownBarcode(
   await notifyAdminsUnknownBarcode(ctx, barcode, client);
 
   client.unknownModel = true;
+  client.modelMatchMethod = "unknown";
   client.hasGreeted = true;
   client.lastInteractionDate = todayStr();
   client.barcodeAttempts = 0;
@@ -1358,11 +1360,16 @@ function isEditDistanceAtMostOne(a: string, b: string): boolean {
 // Barcode solishtirish — IKKALA tomon ham faqat raqamlarga keltirilib
 // solishtiriladi (bo'sh joy, defis, URL bo'laklari e'tiborsiz qoladi).
 // isPartial=true bo'lsa faqat oxirgi 4 raqam solishtiriladi (OCR last4 uchun).
+interface BarcodeMatch {
+  model: CameraModel;
+  method: "exact" | "fuzzy";
+}
+
 function findModelByDigits(
   models: CameraModel[],
   value: string,
   isPartial: boolean
-): CameraModel | undefined {
+): BarcodeMatch | undefined {
   const d = onlyDigits(value);
   if (!d) return undefined;
 
@@ -1372,7 +1379,7 @@ function findModelByDigits(
     // bittasini tanlash noto'g'ri bo'lishi mumkin. Bunday holda "unclear"
     // (undefined) qaytaramiz — chaqiruvchi aniqroq rasm so'raydi.
     const matches = models.filter((m) => m.barcodes.some((b) => onlyDigits(b).slice(-4) === d));
-    return matches.length === 1 ? matches[0] : undefined;
+    return matches.length === 1 ? { model: matches[0]!, method: "exact" } : undefined;
   }
 
   const exactOrPrefix = models.find((m) =>
@@ -1387,7 +1394,7 @@ function findModelByDigits(
       return shorter.length >= 10 && longer.endsWith(shorter);
     })
   );
-  if (exactOrPrefix) return exactOrPrefix;
+  if (exactOrPrefix) return { model: exactOrPrefix, method: "exact" };
 
   // FUZZY MOSLIK — faqat 10+ xonali raqamlarda (qisqa raqamlarda 1 belgi
   // farq juda ko'p mos kelib ketishi mumkin). OCR ba'zan bitta raqamni xato
@@ -1413,7 +1420,7 @@ function findModelByDigits(
         { ocr: d, matched: match.barcode, model: match.model.name },
         `barcode: Fuzzy moslik topildi — OCR ${d} → bazadagi ${match.barcode} (${match.model.name}), masofa=1`
       );
-      return match.model;
+      return { model: match.model, method: "fuzzy" };
     }
     if (fuzzyMatches.length > 1) {
       logger.info(
@@ -1476,6 +1483,7 @@ async function handleModelNameAnswer(
   if (matchedModel) {
     client.lastModelName = matchedModel.name;
     client.unknownModel = false;
+    client.modelMatchMethod = "manual";
     client.hasGreeted = true;
     client.lastInteractionDate = todayStr();
     resetStuck(client);
@@ -1549,7 +1557,7 @@ async function handleTypedBarcode(
   const models = modelsStore.getAll();
   const matched = findModelByDigits(models, digits, false);
   logger.info(
-    { chatId: client.chatId, digits, matched: matched?.name ?? null },
+    { chatId: client.chatId, digits, matched: matched?.model.name ?? null },
     "barcode: mijoz qo'lda yozgan raqam"
   );
 
@@ -1559,16 +1567,17 @@ async function handleTypedBarcode(
   }
 
   if (matched) {
-    client.lastModelName = matched.name;
+    client.lastModelName = matched.model.name;
     client.unknownModel = false;
+    client.modelMatchMethod = matched.method;
     client.hasGreeted = true;
     client.lastInteractionDate = todayStr();
     client.barcodeAttempts = 0;
     client.awaitingModelName = false;
     resetStuck(client);
     clientsStore.save(client);
-    modelMentionsStore.record(matched.name, client.chatId);
-    await announceModel(ctx, client, matched.name, businessConnectionId);
+    modelMentionsStore.record(matched.model.name, client.chatId);
+    await announceModel(ctx, client, matched.model.name, businessConnectionId);
     await sleep(800);
     await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
     return;
@@ -1669,21 +1678,30 @@ async function handleFeedback(
     // hisoblanib, statistikani buzardi.
     client.region = (await classifyRegion(text)) ?? undefined;
     client.feedbackStage = "ask_satisfaction";
+    // Aniq tanlov beruvchi savol — Business chatida inline tugma ishlamaydi,
+    // shuning uchun variantlarni matn ichida ko'rsatamiz. Bu ochiq
+    // "nima xohlaysiz?" ga qaraganda ancha ko'p va sifatliroq javob to'playdi.
     const q = isUz
-      ? "Rahmat. Kamerangizdan qoniqayapsizmi? Nima yoqmaydi yoki qiyin bo'ldi?"
-      : "Спасибо. Довольны ли вы камерой? Что не понравилось или показалось сложным?";
+      ? "Rahmat. Kameradan qoniqasizmi? Javob bering: Ha, Yo'q, yoki Qisman. Biror narsa yoqmagan bo'lsa, qisqacha ham yozing."
+      : "Спасибо. Довольны ли вы камерой? Ответьте: Да, Нет или Отчасти. Если что-то не понравилось — напишите кратко.";
     await sendMsg(ctx, chatId, q, businessConnectionId);
   } else if (client.feedbackStage === "ask_satisfaction") {
-    client.feedback.satisfaction = text;
-    recordProductFeedback(text, client);
+    // "Ha"/"Yo'q"/"Qisman" — bularning o'zi mazmunli javob (qoniqish darajasi),
+    // shuning uchun bu yerda isMeaninglessAnswer QO'LLANMAYDI — faqat butunlay
+    // bo'sh/tinish belgili javoblar (".", "-") "javob berilmagan" hisoblanadi.
+    const trimmed = text.trim();
+    client.feedback.satisfaction = (trimmed.length === 0 || /^[\s.\-_,!?…]+$/.test(trimmed)) ? undefined : trimmed;
+    if (client.feedback.satisfaction) recordProductFeedback(client.feedback.satisfaction, client);
     client.feedbackStage = "ask_wishlist";
     const q = isUz
-      ? "Tushundim. Qanday xususiyatlar bo'lsa kamerangiz yanada yaxshi bo'lardi?"
-      : "Понял. Какие функции сделали бы камеру лучше?";
+      ? "Tushundim. Kamerada yetishmayotgan yoki qo'shilishini xohlagan funksiya bormi? Bo'lsa yozing, bo'lmasa \"yo'q\" deb yozing."
+      : "Понял. Не хватает ли камере какой-то функции, которую вы хотели бы видеть? Если да — напишите, если нет — напишите \"нет\".";
     await sendMsg(ctx, chatId, q, businessConnectionId);
   } else if (client.feedbackStage === "ask_wishlist") {
-    client.feedback.wishlist = text;
-    recordProductFeedback(text, client);
+    // Bu ochiq savol — mazmunsiz javob ("-", "hammasi zo'r") "javob
+    // berilmagan" deb belgilanadi, statistikani chalkashtirmasin.
+    client.feedback.wishlist = isMeaninglessAnswer(text) ? undefined : text.trim();
+    if (client.feedback.wishlist) recordProductFeedback(client.feedback.wishlist, client);
     client.feedbackStage = "ask_location";
     const q = isUz
       ? "Kamera qayerga o'rnatilgan yoki o'rnatmoqchisiz?"
@@ -1935,15 +1953,16 @@ async function handlePhotos(
     if (outcome.match) {
       const matchedModel = findModelByDigits(models, outcome.match.value, outcome.match.isPartial);
       if (matchedModel) {
-        client.lastModelName = matchedModel.name;
+        client.lastModelName = matchedModel.model.name;
         client.unknownModel = false;
+        client.modelMatchMethod = matchedModel.method;
         client.hasGreeted = true;
         client.lastInteractionDate = todayStr();
         client.barcodeAttempts = 0;
         resetStuck(client);
         clientsStore.save(client);
-        modelMentionsStore.record(matchedModel.name, client.chatId);
-        await announceModel(ctx, client, matchedModel.name, businessConnectionId);
+        modelMentionsStore.record(matchedModel.model.name, client.chatId);
+        await announceModel(ctx, client, matchedModel.model.name, businessConnectionId);
         await sleep(800);
         await askConnectionMethodOrDeliver(ctx, client, businessConnectionId);
         return;

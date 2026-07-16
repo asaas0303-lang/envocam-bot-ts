@@ -1,6 +1,8 @@
-import { REGIONS, type ActivityEvent, type ApiBalance, type ClientData, type IssueCategory, type ModelMention, type RefundEvent, type UsageRecord } from "./data/store.js";
+import { REGIONS, type ActivityEvent, type ApiBalance, type ClientData, type IssueCategory, type ModelMention, type QuestionLogEntry, type RefundEvent, type UsageRecord } from "./data/store.js";
 
 export function formatRegionStats(clients: ClientData[]): string {
+  if (clients.length === 0) return "Hali mijozlar yo'q.";
+
   const counts = new Map<string, number>();
   for (const region of REGIONS) counts.set(region, 0);
 
@@ -271,6 +273,89 @@ export function formatNewVsReturningPerWeek(
   }
 
   return `Haftalik yangi/qaytgan mijozlar (Dushanbadan boshlab):\n\n${lines.join("\n")}`;
+}
+
+// ─── Uzoq masofa (router) ulash natijasi ────────────────────────────────────
+// So'rovnomaga bog'liq emas — mavjud connectionMethod/connectionConfirmed/
+// longRangeStage maydonlaridan avtomatik hisoblanadi, qo'shimcha kuzatuv
+// kerak emas.
+
+export function formatLongRangeOutcomes(clients: ClientData[]): string {
+  const started = clients.filter((c) => c.connectionMethod === "long");
+  if (started.length === 0) {
+    return "Hali uzoq masofa (router) orqali ulanish so'ralmagan.";
+  }
+
+  const success = started.filter((c) => c.connectionConfirmed).length;
+  const stuckGuiding = started.filter((c) => !c.connectionConfirmed && c.longRangeStage === "guiding").length;
+  const stuckAsked = started.filter((c) => !c.connectionConfirmed && c.longRangeStage === "asked_status").length;
+  const other = started.length - success - stuckGuiding - stuckAsked;
+
+  const pct = (n: number) => Math.round((n / started.length) * 100);
+
+  const lines = [
+    `Uzoq masofa (router) orqali ulanish natijasi (jami ${started.length} ta mijoz):`,
+    "",
+    `Muvaffaqiyatli ulandi: ${success} ta (${pct(success)}%)`,
+    `Bosqichma-bosqich yordamda yarim yo'lda qoldi: ${stuckGuiding} ta (${pct(stuckGuiding)}%)`,
+    `Boshlang'ich savolga javob kutilmoqda: ${stuckAsked} ta (${pct(stuckAsked)}%)`,
+  ];
+  if (other > 0) lines.push(`Boshqa usulga o'tdi yoki noaniq: ${other} ta (${pct(other)}%)`);
+
+  return lines.join("\n");
+}
+
+// ─── Model aniqlash statistikasi ────────────────────────────────────────────
+// Barcode qanday usulda o'qilgani (aniq/fuzzy/qo'lda/topilmadi) —
+// findModelByDigits va handleUnknownBarcode client.modelMatchMethod'ni
+// belgilaydi, bu funksiya faqat hisoblaydi.
+
+export function formatModelIdStats(clients: ClientData[]): string {
+  const resolved = clients.filter((c) => c.lastModelName || c.unknownModel);
+  if (resolved.length === 0) {
+    return "Hali model aniqlash urinishlari qayd etilmagan.";
+  }
+
+  const exact = clients.filter((c) => c.modelMatchMethod === "exact").length;
+  const fuzzy = clients.filter((c) => c.modelMatchMethod === "fuzzy").length;
+  const manual = clients.filter((c) => c.modelMatchMethod === "manual").length;
+  const unknown = clients.filter((c) => c.modelMatchMethod === "unknown").length;
+  const untagged = resolved.length - exact - fuzzy - manual - unknown;
+
+  const pct = (n: number) => Math.round((n / resolved.length) * 100);
+
+  const lines = [
+    `Model aniqlash statistikasi (jami ${resolved.length} ta urinish):`,
+    "",
+    `Aniq barcode moslik: ${exact} ta (${pct(exact)}%)`,
+    `Fuzzy moslik (1 xato bilan tuzatildi): ${fuzzy} ta (${pct(fuzzy)}%)`,
+    `Mijoz qo'lda model nomini yozdi: ${manual} ta (${pct(manual)}%)`,
+    `Barcode o'qildi, lekin bazada topilmadi: ${unknown} ta (${pct(unknown)}%)`,
+  ];
+  if (untagged > 0) {
+    lines.push(`Eski yozuvlar (usul saqlanmagan): ${untagged} ta (${pct(untagged)}%)`);
+  }
+
+  return lines.join("\n");
+}
+
+// ─── Savollarga javob berish qamrovi (bilim bazasi) ─────────────────────────
+// questionLogStore'dagi wasAnsweredFromKB maydonidan hisoblanadi.
+
+export function formatQuestionCoverageStats(entries: QuestionLogEntry[]): string {
+  if (entries.length === 0) {
+    return "Hali savollar jurnali bo'sh.";
+  }
+
+  const fromKB = entries.filter((e) => e.wasAnsweredFromKB).length;
+  const needAdmin = entries.length - fromKB;
+  const pct = (n: number) => Math.round((n / entries.length) * 100);
+
+  return (
+    `Savollarga javob berish statistikasi (jami ${entries.length} ta savol):\n\n` +
+    `Bilim bazasidan avtomatik javob berildi: ${fromKB} ta (${pct(fromKB)}%)\n` +
+    `Adminga yo'naltirildi (bilim bazasida yo'q edi): ${needAdmin} ta (${pct(needAdmin)}%)`
+  );
 }
 
 // ─── API xarajat hisoboti ────────────────────────────────────────────────────

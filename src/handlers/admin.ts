@@ -20,7 +20,7 @@ import {
 } from "../data/store.js";
 import { isAdmin, downloadFileAsBase64, sleep } from "../helpers.js";
 import { logger } from "../lib/logger.js";
-import { extractTextFromImage, analyzeInsights, analyzeQuestionClusters } from "../ai.js";
+import { extractTextFromImage, analyzeInsights, analyzeQuestionClusters, QUESTION_CLUSTER_BATCH_SIZE } from "../ai.js";
 import { COLLAGE_MAX_IMAGES, rebuildModelCollageForDiagnostics } from "../collage.js";
 import { sendReportNow } from "../tasks.js";
 import {
@@ -33,6 +33,9 @@ import {
   formatRefundStats,
   formatNewVsReturningPerWeek,
   formatCostReport,
+  formatLongRangeOutcomes,
+  formatModelIdStats,
+  formatQuestionCoverageStats,
 } from "../stats.js";
 
 type AdminState =
@@ -383,7 +386,11 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
       return;
     }
 
-    await ctx.reply(`Tahlil qilinmoqda (${entries.length} ta savol)...`);
+    if (entries.length > QUESTION_CLUSTER_BATCH_SIZE) {
+      await ctx.reply(`${entries.length} ta savol juda ko'p, qismlab tahlil qilyapman, biroz vaqt ketishi mumkin...`);
+    } else {
+      await ctx.reply(`Tahlil qilinmoqda (${entries.length} ta savol)...`);
+    }
 
     const allModels = modelsStore.getAll();
     const existingFaq = [
@@ -391,10 +398,17 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
       ...settingsStore.getGlobalFaqItems().map((f) => f.question),
     ];
 
-    const clusters = await analyzeQuestionClusters(entries.map((e) => e.question), existingFaq);
+    let clusters: Awaited<ReturnType<typeof analyzeQuestionClusters>> = [];
+    try {
+      clusters = await analyzeQuestionClusters(entries.map((e) => e.question), existingFaq);
+    } catch (err) {
+      logger.error({ err, adminId: ctx.from.id, entryCount: entries.length }, "/savollar: analyzeQuestionClusters xatolik berdi");
+      await ctx.reply(`Tahlil qilishda xatolik yuz berdi: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
 
     if (clusters.length === 0) {
-      await ctx.reply("Tahlil qilishda xatolik yuz berdi yoki natija bo'sh. Birozdan so'ng qayta urinib ko'ring.");
+      await ctx.reply("Tahlil natijasi bo'sh chiqdi — AI javobini o'qib bo'lmadi. Birozdan so'ng qayta urinib ko'ring (xato loglarga yozildi).");
       return;
     }
 
@@ -623,6 +637,36 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     await ctx.answerCbQuery();
     const text = formatNewVsReturningPerWeek(clientsStore.getAll(), activityStore.getAll());
     await sendChunkedReply(ctx, text, Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+    ]));
+  });
+
+  // ── Uzoq masofa (router) ulash natijasi ──
+  bot.action("admin_stats_longrange", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatLongRangeOutcomes(clientsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+    ]));
+  });
+
+  // ── Model aniqlash statistikasi (barcode aniq/fuzzy/qo'lda/topilmadi) ──
+  bot.action("admin_stats_modelid", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatModelIdStats(clientsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([
+      [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+    ]));
+  });
+
+  // ── Savollarga javob qamrovi (bilim bazasi vs admin) ──
+  bot.action("admin_stats_qcoverage", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatQuestionCoverageStats(questionLogStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([
       [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
     ]));
   });
@@ -1370,6 +1414,9 @@ function buildStatsMenu() {
      Markup.button.callback("Yangi/qaytgan (haftalik)", "admin_stats_weekly")],
     [Markup.button.callback("Model bo'yicha muammolar", "admin_stats_model_issues")],
     [Markup.button.callback("Mijoz istaklari (AI tahlil)", "admin_stats_insights")],
+    [Markup.button.callback("Uzoq masofa natijasi", "admin_stats_longrange"),
+     Markup.button.callback("Model aniqlash usuli", "admin_stats_modelid")],
+    [Markup.button.callback("Savollar qamrovi (bilim bazasi)", "admin_stats_qcoverage")],
     [Markup.button.callback("Umumiy statistika", "admin_stats_general")],
     [Markup.button.callback("⬅️ Asosiy menyu", "admin_back_main")],
   ]);
@@ -1434,14 +1481,22 @@ async function performInsightsAnalysis(ctx: BotContext): Promise<void> {
     return;
   }
 
-  const text = await analyzeInsights(feedbacks);
-  reportsStore.setCachedInsights(text);
-  const ts = new Date().toLocaleString("uz-UZ", { timeZone: "Asia/Tashkent" });
-  await sendChunkedReply(
-    ctx,
-    `${text}\n\nTahlil qilingan: ${ts} | Jami so'rovnoma: ${feedbacks.length} ta`,
-    Markup.inlineKeyboard([[Markup.button.callback("Qayta tahlil", "admin_stats_insights_refresh"), Markup.button.callback("⬅️ Orqaga", "admin_stats")]])
-  );
+  try {
+    const text = await analyzeInsights(feedbacks);
+    reportsStore.setCachedInsights(text);
+    const ts = new Date().toLocaleString("uz-UZ", { timeZone: "Asia/Tashkent" });
+    await sendChunkedReply(
+      ctx,
+      `${text}\n\nTahlil qilingan: ${ts} | Jami so'rovnoma: ${feedbacks.length} ta`,
+      Markup.inlineKeyboard([[Markup.button.callback("Qayta tahlil", "admin_stats_insights_refresh"), Markup.button.callback("⬅️ Orqaga", "admin_stats")]])
+    );
+  } catch (err) {
+    logger.error({ err, adminId: ctx.from?.id, feedbackCount: feedbacks.length }, "performInsightsAnalysis: tahlil qilishda xatolik");
+    await ctx.reply(
+      `Tahlil qilishda xatolik yuz berdi: ${err instanceof Error ? err.message : String(err)}`,
+      Markup.inlineKeyboard([[Markup.button.callback("⬅️ Statistika", "admin_stats")]])
+    );
+  }
 }
 
 async function showMainMenu(ctx: BotContext): Promise<void> {
