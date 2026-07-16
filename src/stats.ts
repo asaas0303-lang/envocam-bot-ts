@@ -358,6 +358,140 @@ export function formatQuestionCoverageStats(entries: QuestionLogEntry[]): string
   );
 }
 
+// ─── Javob kutayotgan mijozlar (bot hal qila olmagan / admin aralashuvi kerak) ──
+// /kutayotgan buyrug'i va kunlik xulosadagi son shu bitta mezondan hisoblanadi
+// — ikkalasi ham bir xil natija ko'rsatsin.
+
+const AWAITING_STUCK_LOOKBACK_MS = 3 * 24 * 60 * 60 * 1000;
+
+export function isAwaitingAdmin(c: ClientData, nowMs: number): string[] {
+  const reasons: string[] = [];
+  if (c.stuckAdminNotified) reasons.push("bot tiqilib qoldi");
+  if ((c.unresolvedCount ?? 0) >= 2) reasons.push("ketma-ket tushunmadim");
+  if (c.awaitingModelName || c.unknownModel) reasons.push("model aniqlanmadi");
+  if (
+    !c.connectionConfirmed &&
+    c.lastVideoSentAt &&
+    nowMs - new Date(c.lastSeen).getTime() <= AWAITING_STUCK_LOOKBACK_MS
+  ) {
+    reasons.push("ulanish tasdiqlanmagan");
+  }
+  if (c.refundRequested) reasons.push("qaytarish so'radi");
+  return reasons;
+}
+
+// ─── Kunlik xulosa ───────────────────────────────────────────────────────────
+// Har kuni 21:00da avtomatik va /kunlik buyrug'i bilan istalgan vaqtda
+// yuboriladi. AI CHAQIRMAYDI (xarajat oshmasin) — "eng ko'p savol" ro'yxati
+// oddiy matn chastotasi bo'yicha hisoblanadi, semantik guruhlash uchun
+// /savollar (AI tahlil) ishlatilsin.
+
+export function startOfTashkentTodayMs(): number {
+  const nowUZ = new Date(Date.now() + TASHKENT_OFFSET_MS);
+  const dayStartUZ = Date.UTC(nowUZ.getUTCFullYear(), nowUZ.getUTCMonth(), nowUZ.getUTCDate());
+  return dayStartUZ - TASHKENT_OFFSET_MS;
+}
+
+function truncateText(text: string, max: number): string {
+  return text.length > max ? text.slice(0, max) + "…" : text;
+}
+
+const MATCH_METHOD_LABELS: Record<string, string> = {
+  exact: "exact",
+  fuzzy: "fuzzy",
+  manual: "qo'lda",
+  unknown: "topilmadi",
+};
+
+export function formatDailySummary(
+  clients: ClientData[],
+  todayQuestions: QuestionLogEntry[],
+  usage: UsageRecord[],
+  balance: ApiBalance | undefined
+): string {
+  const tashkentToday = tashkentDateStrFor(new Date());
+  // lastInteractionDate client.ts'da new Date().toISOString().slice(0,10)
+  // (UTC kun) bilan saqlanadi — shu maydon bilan solishtirishda ham xuddi
+  // shu UTC formatdan foydalanamiz, aks holda Toshkent kechqurun/tunda
+  // mos kelmay qoladi.
+  const utcToday = new Date().toISOString().slice(0, 10);
+
+  const newToday = clients.filter((c) => tashkentDateStrFor(new Date(c.firstSeen)) === tashkentToday).length;
+  const activeToday = clients.filter((c) => tashkentDateStrFor(new Date(c.lastSeen)) === tashkentToday);
+  const confirmedToday = activeToday.filter((c) => c.connectionConfirmed).length;
+
+  const now = Date.now();
+  const awaitingCount = clients.filter((c) => isAwaitingAdmin(c, now).length > 0).length;
+
+  const lines: string[] = [
+    `📊 Kunlik xulosa — ${tashkentToday}`,
+    "",
+    "Mijozlar:",
+    `- Bugun yangi mijozlar: ${newToday} ta`,
+    `- Bugun yozganlar: ${activeToday.length} ta`,
+    `- Muvaffaqiyatli hal bo'ldi: ${confirmedToday} ta`,
+    `- Javob kutayotgan / hal bo'lmagan: ${awaitingCount} ta`,
+    "",
+  ];
+
+  // Eng ko'p savol berilgan mavzular — oddiy matn chastotasi (AI emas)
+  const topicMap = new Map<string, { text: string; count: number }>();
+  for (const q of todayQuestions) {
+    const key = q.question.trim().toLowerCase().replace(/[?!.,;:]/g, "").replace(/\s+/g, " ");
+    if (!key) continue;
+    const existing = topicMap.get(key);
+    if (existing) existing.count++;
+    else topicMap.set(key, { text: q.question, count: 1 });
+  }
+  const topTopics = [...topicMap.values()].sort((a, b) => b.count - a.count).slice(0, 3);
+
+  if (topTopics.length > 0) {
+    lines.push("Eng ko'p savol berilgan mavzular (bugun):");
+    topTopics.forEach((t, i) => lines.push(`${i + 1}. "${truncateText(t.text, 50)}" — ${t.count} marta`));
+  } else {
+    lines.push("Bugun savollar qayd etilmagan.");
+  }
+  lines.push("");
+
+  // Model aniqlash — bugun faollashgan (lastInteractionDate) mijozlar bo'yicha
+  const identifiedToday = clients.filter(
+    (c) => c.lastInteractionDate === utcToday && (c.lastModelName || c.unknownModel)
+  );
+  if (identifiedToday.length > 0) {
+    const byMethod = new Map<string, number>();
+    for (const c of identifiedToday) {
+      const method = c.modelMatchMethod ?? (c.unknownModel ? "unknown" : "noma'lum");
+      byMethod.set(method, (byMethod.get(method) ?? 0) + 1);
+    }
+    const unknownCount = byMethod.get("unknown") ?? 0;
+    const identifiedCount = identifiedToday.length - unknownCount;
+    const breakdown = [...byMethod.entries()]
+      .filter(([method]) => method !== "unknown")
+      .map(([method, count]) => `${count} ${MATCH_METHOD_LABELS[method] ?? method}`)
+      .join(", ");
+    lines.push(
+      `Model aniqlash (bugun): ${identifiedCount} ta aniqlandi${breakdown ? ` (${breakdown})` : ""}, ${unknownCount} ta topilmadi`
+    );
+  } else {
+    lines.push("Model aniqlash: bugun urinish bo'lmagan.");
+  }
+  lines.push("");
+
+  // Bilim bazasi qamrovi
+  if (todayQuestions.length > 0) {
+    const fromKB = todayQuestions.filter((q) => q.wasAnsweredFromKB).length;
+    const needAdmin = todayQuestions.length - fromKB;
+    lines.push(`Bilim bazasi: ${fromKB} ta savolga avtomatik javob berildi, ${needAdmin} ta adminga yo'naltirildi`);
+  } else {
+    lines.push("Bilim bazasi: bugun savol bo'lmagan.");
+  }
+  lines.push("");
+
+  lines.push(formatDailyCostSummary(usage, balance));
+
+  return lines.join("\n");
+}
+
 // ─── API xarajat hisoboti ────────────────────────────────────────────────────
 
 function tashkentDateStrFor(date: Date): string {

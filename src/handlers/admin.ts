@@ -36,6 +36,9 @@ import {
   formatLongRangeOutcomes,
   formatModelIdStats,
   formatQuestionCoverageStats,
+  formatDailySummary,
+  startOfTashkentTodayMs,
+  isAwaitingAdmin,
 } from "../stats.js";
 
 type AdminState =
@@ -143,6 +146,75 @@ function clientLabel(c: ClientData): string {
   return `${idTail} — ${name} — ${when} — ${tail}`;
 }
 
+const MATCH_METHOD_LABELS: Record<string, string> = {
+  exact: "aniq barcode moslik",
+  fuzzy: "fuzzy moslik (1 xato tuzatilib)",
+  manual: "mijoz qo'lda nom yozdi",
+  unknown: "topilmadi",
+};
+
+// /mijoz buyrug'i uchun bitta mijozning to'liq profili.
+function formatClientProfile(c: ClientData): string {
+  const name = c.firstName?.trim() ? c.firstName.trim() : "(ismsiz)";
+  const uname = c.username ? `@${c.username}` : "yo'q";
+  const langLabel = c.language === "ru" ? "ruscha" : c.language === "uz-cyrl" ? "o'zbekcha (krill)" : "o'zbekcha";
+
+  const lines = [
+    `👤 ${name} (${uname})`,
+    `chatId: ${c.chatId}`,
+    `Til: ${langLabel}`,
+    `Birinchi ko'rilgan: ${relativeTime(c.firstSeen)}`,
+    `Oxirgi faollik: ${relativeTime(c.lastSeen)}`,
+    "",
+  ];
+
+  if (c.lastModelName) {
+    const method = c.modelMatchMethod ? MATCH_METHOD_LABELS[c.modelMatchMethod] ?? c.modelMatchMethod : "usul noma'lum (eski yozuv)";
+    lines.push(`Model: ${c.lastModelName} (${method})`);
+  } else if (c.unknownModel) {
+    lines.push("Model: aniqlanmadi (barcode o'qildi, bazada topilmadi)");
+  } else {
+    lines.push("Model: hali aniqlanmagan");
+  }
+
+  if (c.connectionMethod) {
+    const methodLabel = c.connectionMethod === "short" ? "qisqa masofa (video)" : "uzoq masofa (router)";
+    lines.push(`Ulanish usuli: ${methodLabel} — ${c.connectionConfirmed ? "tasdiqlangan ✅" : "tasdiqlanmagan"}`);
+  }
+
+  if (c.region) lines.push(`Viloyat: ${c.region}`);
+
+  if (c.feedback) {
+    const answers: string[] = [];
+    if (c.feedback.satisfaction) answers.push(`- Qoniqish: ${c.feedback.satisfaction}`);
+    if (c.feedback.wishlist) answers.push(`- Istak: ${c.feedback.wishlist}`);
+    if (c.feedback.location) answers.push(`- O'rnatish joyi: ${c.feedback.location}`);
+    if (c.feedback.purpose) answers.push(`- Maqsad: ${c.feedback.purpose}`);
+    if (c.feedback.budget) answers.push(`- Narx: ${c.feedback.budget}`);
+    if (answers.length > 0) lines.push("", "So'rovnoma javoblari:", ...answers);
+  }
+
+  const statusFlags: string[] = [];
+  if (c.feedbackStage && c.feedbackStage !== "done") statusFlags.push(`so'rovnoma bosqichi: ${c.feedbackStage}`);
+  if (c.awaitingConnectionMethod) statusFlags.push("ulanish usuli so'ralgan, javob kutilmoqda");
+  if (c.awaitingModelName) statusFlags.push("model nomi so'ralgan, javob kutilmoqda");
+  if (c.longRangeStage) statusFlags.push(`uzoq masofa: ${c.longRangeStage}`);
+  if (c.unknownModel) statusFlags.push("model noma'lum (umumiy yordam rejimida)");
+  if (c.refundRequested) statusFlags.push("pul qaytarish so'ragan");
+  if (statusFlags.length > 0) lines.push("", `Hozirgi holat: ${statusFlags.join(", ")}`);
+
+  const hist = (c.messageHistory || []).slice(-7);
+  if (hist.length > 0) {
+    lines.push("", "Oxirgi xabarlar:");
+    for (const m of hist) {
+      const who = m.role === "user" ? "Mijoz" : "Bot";
+      lines.push(`${who}: ${short(m.content, 80)}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 async function doTestReset(ctx: BotContext, chatId: string): Promise<void> {
   const before = clientsStore.getById(chatId);
   const name = before?.firstName?.trim() || (before?.username ? "@" + before.username : chatId);
@@ -165,6 +237,9 @@ const ADMIN_HELP_TEXT = [
   "/stats — statistika menyusini ochadi (joylashuv, muammolar, modellar va h.k.)",
   "/xarajat — API xarajat hisoboti (bugungi/7 kunlik/jami sarf, qolgan balans, taxminiy kunlar)",
   "/savollar — mijoz savollarini mavzuga ko'ra AI bilan tahlil qiladi, eng ko'p so'ralganlarini va bilim bazasida yo'qlarini ko'rsatadi. /savollar <kun soni> — davrni tanlash (standart 30 kun)",
+  "/kunlik — bugungi kunlik xulosa: yangi/faol mijozlar, hal bo'lganlar, eng ko'p savol mavzulari, model aniqlash statistikasi, bilim bazasi qamrovi, API xarajat. Har kuni soat 21:00da avtomatik ham yuboriladi",
+  "/kutayotgan — bot hal qila olmagan yoki admin aralashuvi kerak bo'lgan mijozlar ro'yxati (tiqilib qolgan, model aniqlanmagan, ulanish tasdiqlanmagan, pul qaytarish so'ragan)",
+  "/mijoz <ism, username yoki chatId> — bitta mijozning to'liq profilini ko'rsatadi (model, ulanish holati, so'rovnoma javoblari, oxirgi xabarlar)",
   "/testreset — bitta mijozning suhbat holatini yangi mijozdek tozalaydi (sinov uchun). Argumentsiz — oxirgi 15 mijoz ro'yxati; /testreset <raqam> — ro'yxatdan tanlash; /testreset <ism/matn> — qidirish; /testreset <chatId> — to'g'ridan-to'g'ri",
   "/yordam — shu ro'yxat",
 ].join("\n");
@@ -369,6 +444,89 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     await ctx.reply(text, Markup.inlineKeyboard([
       [Markup.button.callback("API balans", "admin_api_balance")],
     ]));
+  });
+
+  // ── Kunlik xulosa (mijozlar, savollar, model aniqlash, xarajat) — istalgan vaqtda ──
+  bot.command("kunlik", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    const todayQuestions = questionLogStore.getSince(startOfTashkentTodayMs());
+    const text = formatDailySummary(clientsStore.getAll(), todayQuestions, usageStore.getAll(), usageStore.getBalance());
+    await sendChunkedReply(ctx, text);
+  });
+
+  // ── Javob kutayotgan / hal bo'lmagan mijozlar ──
+  bot.command("kutayotgan", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    const now = Date.now();
+    const matches = clientsStore
+      .getAll()
+      .map((c) => ({ client: c, reasons: isAwaitingAdmin(c, now) }))
+      .filter((m) => m.reasons.length > 0)
+      .sort((a, b) => new Date(b.client.lastSeen).getTime() - new Date(a.client.lastSeen).getTime());
+
+    if (matches.length === 0) {
+      await ctx.reply("✅ Hozircha javob kutayotgan mijoz yo'q.");
+      return;
+    }
+
+    const lines = matches.map(({ client: c, reasons }, i) => {
+      const name = c.firstName?.trim() ? c.firstName.trim() : c.username ? "@" + c.username : "(ismsiz)";
+      const msg = lastUserText(c);
+      return (
+        `${i + 1}. ${name} (...${c.chatId.slice(-4)}) — ${reasons.join(", ")}\n` +
+        `   Oxirgi: ${relativeTime(c.lastSeen)} — "${short(msg, 30)}"\n` +
+        `   tg://user?id=${c.chatId}`
+      );
+    });
+
+    await sendChunkedReply(ctx, `⏳ Javob kutayotgan mijozlar (${matches.length} ta):\n\n${lines.join("\n\n")}`);
+  });
+
+  // ── Mijozni qidirish (ism, username yoki chatId) ──
+  bot.command("mijoz", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    const rawText = ("text" in ctx.message ? ctx.message.text : "") as string;
+    const arg = rawText.replace(/^\/mijoz(@\S+)?\s*/i, "").trim();
+
+    if (!arg) {
+      await ctx.reply("Foydalanish: /mijoz <ism, username yoki chatId>");
+      return;
+    }
+
+    // To'g'ridan-to'g'ri chatId (5+ xonali raqam).
+    if (/^\d{5,}$/.test(arg)) {
+      const client = clientsStore.getById(arg);
+      if (!client) {
+        await ctx.reply(`chatId "${arg}" topilmadi.`);
+        return;
+      }
+      await sendChunkedReply(ctx, formatClientProfile(client));
+      return;
+    }
+
+    const needle = arg.toLowerCase();
+    const matches = clientsStore.getAll().filter((c) => {
+      const name = (c.firstName ?? "").toLowerCase();
+      const uname = (c.username ?? "").toLowerCase();
+      return name.includes(needle) || uname.includes(needle) || c.chatId.includes(arg);
+    });
+
+    if (matches.length === 0) {
+      await ctx.reply(`"${arg}" bo'yicha hech narsa topilmadi.`);
+      return;
+    }
+    if (matches.length === 1) {
+      await sendChunkedReply(ctx, formatClientProfile(matches[0]));
+      return;
+    }
+
+    const top = matches
+      .sort((a, b) => new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime())
+      .slice(0, 15);
+    const lines = top.map((c, i) => `${i + 1}. ${clientLabel(c)} — chatId: ${c.chatId}`);
+    await ctx.reply(
+      `"${arg}" bo'yicha ${matches.length} ta mos keldi. Aniqrog'i uchun /mijoz <chatId> yuboring:\n\n` + lines.join("\n")
+    );
   });
 
   // ── Mijoz savollarini mavzuga ko'ra tahlil qilish (bilim bazasini to'ldirish uchun) ──
