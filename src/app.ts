@@ -2,7 +2,6 @@ import { Telegraf } from "telegraf";
 import type { BotContext } from "./types.js";
 import { registerAdminHandlers } from "./handlers/admin.js";
 import { registerClientHandlers } from "./handlers/client.js";
-import { startBackgroundTasks } from "./tasks.js";
 import { logger } from "./lib/logger.js";
 
 const token = process.env["BOT_TOKEN"] || process.env["TELEGRAM_BOT_TOKEN"];
@@ -34,10 +33,9 @@ bot.catch((err, ctx) => {
 
 registerAdminHandlers(bot);
 registerClientHandlers(bot);
-startBackgroundTasks(bot);
 
 bot.launch({ dropPendingUpdates: true }).then(() => {
-  logger.info("EnvoCam bot started (long polling)");
+  logger.info("Bot started (long polling)");
 }).catch((err) => {
   logger.error({ err }, "Bot launch failed");
 });
