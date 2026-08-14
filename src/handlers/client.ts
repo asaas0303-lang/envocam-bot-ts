@@ -68,6 +68,7 @@ async function handleModelQuery(ctx: BotContext, chatId: string, text: string): 
 
 export function registerClientHandlers(bot: Telegraf<BotContext>): void {
   bot.start(async (ctx) => {
+    logger.info({ chatId: ctx.chat ? String(ctx.chat.id) : null }, "bot.start: /start qabul qilindi");
     if (!ctx.from || isAdmin(ctx.from.id)) return;
     getOrCreateClient(String(ctx.chat.id), ctx.from.first_name, ctx.from.username);
     await ctx.reply(GREETING_TEXT);
@@ -75,6 +76,14 @@ export function registerClientHandlers(bot: Telegraf<BotContext>): void {
 
   bot.on("message", async (ctx) => {
     const from = ctx.from;
+    const chatIdForLog = ctx.chat ? String(ctx.chat.id) : null;
+    const rawMsg = ctx.message as unknown as Record<string, unknown>;
+    const rawText = typeof rawMsg["text"] === "string" ? (rawMsg["text"] as string) : undefined;
+    logger.info(
+      { chatId: chatIdForLog, textPreview: rawText ? rawText.slice(0, 20) : null },
+      "bot.on(message): xabar qabul qilindi"
+    );
+
     if (!from || isAdmin(from.id)) return;
 
     const chatId = String(ctx.chat.id);
