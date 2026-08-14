@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { logger } from "../lib/logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Railway'da volume ulanganda bu papka doimiy diskka ishora qiladi;
@@ -60,7 +61,8 @@ function loadDb(): DbShape {
         clients: parsed.clients ?? [],
         modelRequests: parsed.modelRequests ?? [],
       };
-    } catch {
+    } catch (err) {
+      logger.error({ err, DATA_FILE }, "data.json o'qib bo'lmadi (buzilgan JSON?) — bo'sh baza bilan boshlanadi");
       return emptyDb();
     }
   }

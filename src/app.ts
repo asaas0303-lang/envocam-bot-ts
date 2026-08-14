@@ -34,8 +34,23 @@ bot.catch((err, ctx) => {
 registerAdminHandlers(bot);
 registerClientHandlers(bot);
 
-bot.launch({ dropPendingUpdates: true }).then(() => {
-  logger.info("Bot started (long polling)");
-}).catch((err) => {
-  logger.error({ err }, "Bot launch failed");
-});
+logger.info("Bot ishga tushirilmoqda — Telegram API bilan bog'lanish tekshirilmoqda...");
+
+// MUHIM: Telegraf'da long-polling rejimida bot.launch() qaytargan Promise
+// FAQAT bot TO'XTAGANDA (bot.stop()) resolve bo'ladi — .then() ichiga
+// "ishga tushdi" logini qo'yish uni bot normal ishlab turgan holatda ham
+// HECH QACHON chiqarmaydi. Shuning uchun avval getMe() bilan ulanishni
+// tasdiqlaymiz (bu tezda resolve/reject bo'ladi), so'ng launch'ni chaqirib,
+// CHAQIRILGANI haqida darhol log yozamiz — uning yakunlanishini kutmasdan.
+bot.telegram.getMe()
+  .then((me) => {
+    logger.info({ username: me.username }, "Telegram API bilan bog'lanish OK");
+    bot.launch({ dropPendingUpdates: true }).catch((err) => {
+      logger.error({ err }, "Bot launch xatolik bilan yakunlandi");
+    });
+    logger.info("Bot polling rejimida ishga tushdi");
+  })
+  .catch((err) => {
+    logger.error({ err }, "Telegram API bilan bog'lanib bo'lmadi (BOT_TOKEN yoki tarmoq muammosi bo'lishi mumkin)");
+    process.exit(1);
+  });
