@@ -1,7 +1,8 @@
 import { Telegraf, Markup } from "telegraf";
 import type { BotContext } from "../types.js";
 import { clientsStore, modelRequestsStore, modelsStore, type CameraModel } from "../data/store.js";
-import { isAdmin } from "../helpers.js";
+import { isAdmin, sleep } from "../helpers.js";
+import { logger } from "../lib/logger.js";
 import {
   formatBusiestDay,
   formatCoverageRate,
@@ -22,7 +23,9 @@ type AdminState =
   | { step: "awaiting_model_name" }
   | { step: "awaiting_video"; modelName: string; chain: boolean }
   | { step: "awaiting_setup_link"; modelName: string; chain: boolean }
-  | { step: "awaiting_description"; modelName: string; chain: boolean };
+  | { step: "awaiting_description"; modelName: string; chain: boolean }
+  | { step: "broadcast_text" }
+  | { step: "broadcast_confirm"; text: string; photoFileId?: string; videoFileId?: string };
 
 const adminState = new Map<number, AdminState>();
 function getState(uid: number): AdminState { return adminState.get(uid) || { step: "idle" }; }
@@ -65,6 +68,37 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     await ctx.answerCbQuery();
     setState(ctx.from.id, { step: "awaiting_model_name" });
     await ctx.editMessageText("Yangi model nomini yozing:\n(Bekor — /panel)");
+  });
+
+  // ── Xabar yuborish (broadcast) ──
+  bot.action("admin_broadcast", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    setState(ctx.from.id, { step: "broadcast_text" });
+    await ctx.editMessageText(
+      "Barcha mijozlarga yuboriladigan xabar matnini yozing. Xohlasangiz rasm yoki video biriktirib, matnni izoh (caption) sifatida yuborishingiz mumkin.\n(Bekor — /panel)"
+    );
+  });
+
+  bot.action("admin_broadcast_send", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const state = getState(ctx.from.id);
+    if (state.step !== "broadcast_confirm") return;
+    clearState(ctx.from.id);
+
+    const adminChatId = String(ctx.chat!.id);
+    const total = clientsStore.count();
+    await ctx.editMessageText(`Yuborish boshlandi... (${total} ta mijozga)`);
+
+    void broadcastToAll(ctx, state.text, state.photoFileId, state.videoFileId, adminChatId);
+  });
+
+  bot.action("admin_broadcast_cancel", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    clearState(ctx.from.id);
+    await ctx.editMessageText("Bekor qilindi.", buildMainMenu());
   });
 
   // ── Modellar ro'yxati ──
@@ -255,6 +289,30 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     const msg = ctx.message as unknown as Record<string, unknown>;
     const text = typeof msg["text"] === "string" ? (msg["text"] as string).trim() : undefined;
 
+    if (state.step === "broadcast_text") {
+      const caption = typeof msg["caption"] === "string" ? (msg["caption"] as string).trim() : undefined;
+      const broadcastText = text || caption;
+      const photo = "photo" in msg && Array.isArray(msg["photo"]) ? (msg["photo"] as Array<{ file_id: string }>) : undefined;
+      const photoFileId = photo && photo.length > 0 ? photo[photo.length - 1].file_id : undefined;
+      const video = "video" in msg && msg["video"] ? (msg["video"] as { file_id: string }) : undefined;
+      const videoFileId = video?.file_id;
+
+      if (!broadcastText) {
+        await ctx.reply("Xabar matnini (yoki rasm/video izohini) yozing.");
+        return;
+      }
+
+      const total = clientsStore.count();
+      setState(ctx.from.id, { step: "broadcast_confirm", text: broadcastText, photoFileId, videoFileId });
+      await ctx.reply(
+        `${total} ta mijozga yuborilsinmi?\n\n"${short(broadcastText, 200)}"`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("✅ Ha", "admin_broadcast_send"), Markup.button.callback("❌ Yo'q", "admin_broadcast_cancel")],
+        ])
+      );
+      return;
+    }
+
     if (state.step === "awaiting_model_name") {
       if (!text) { await ctx.reply("Model nomini matn qilib yozing."); return; }
       const exists = modelsStore.getAll().some((m) => m.name.toLowerCase() === text.toLowerCase());
@@ -359,6 +417,7 @@ function buildMainMenu() {
     [Markup.button.callback("Modellar ro'yxati", "admin_models_list"),
      Markup.button.callback("Yangi model", "admin_add_model")],
     [Markup.button.callback(`Mijozlar: ${total} ta`, "admin_noop")],
+    [Markup.button.callback("Barcha mijozlarga xabar yuborish", "admin_broadcast")],
     [Markup.button.callback("Statistika", "admin_stats")],
   ]);
 }
@@ -417,4 +476,50 @@ async function showModelMenu(ctx: BotContext, modelName: string, edit: boolean):
 
 async function showModelMenuNew(ctx: BotContext, modelName: string): Promise<void> {
   await showModelMenu(ctx, modelName, false);
+}
+
+// ─── Xabar yuborish (broadcast) ────────────────────────────────────────────
+// Handler qaytgandan keyin ham davom etadi (fire-and-forget) — minglab
+// mijoz bo'lsa ham Telegraf'ning handler timeout'iga urilmaslik uchun.
+// Telegram spam-himoyasi: sekundiga ~25-30 xabar limiti bor, shuning uchun
+// har yuborishdan keyin 45ms kutamiz (~22 xabar/soniya, xavfsiz zaxira bilan).
+const BROADCAST_DELAY_MS = 45;
+
+async function broadcastToAll(
+  ctx: BotContext,
+  text: string,
+  photoFileId: string | undefined,
+  videoFileId: string | undefined,
+  adminChatId: string
+): Promise<void> {
+  const clients = clientsStore.getAll();
+  let sent = 0;
+  let failed = 0;
+
+  for (const client of clients) {
+    try {
+      if (photoFileId) {
+        await ctx.telegram.sendPhoto(client.chatId, photoFileId, { caption: text });
+      } else if (videoFileId) {
+        await ctx.telegram.sendVideo(client.chatId, videoFileId, { caption: text });
+      } else {
+        await ctx.telegram.sendMessage(client.chatId, text);
+      }
+      sent++;
+    } catch (err) {
+      // Mijoz botni bloklagan yoki boshqa xato bo'lishi mumkin — jarayon davom etadi.
+      failed++;
+      logger.warn({ err, chatId: client.chatId }, "broadcast: mijozga yuborilmadi");
+    }
+    await sleep(BROADCAST_DELAY_MS);
+  }
+
+  try {
+    await ctx.telegram.sendMessage(
+      adminChatId,
+      `Xabar yuborish tugadi: ${clients.length} ta mijozdan ${sent} tasiga yuborildi, ${failed} tasi bloklagan/xato bergan.`
+    );
+  } catch (err) {
+    logger.error({ err, adminChatId }, "broadcast: adminga xulosa yuborilmadi");
+  }
 }
