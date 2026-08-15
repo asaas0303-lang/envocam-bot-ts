@@ -2,6 +2,9 @@ import { Telegraf } from "telegraf";
 import type { BotContext } from "./types.js";
 import { registerAdminHandlers } from "./handlers/admin.js";
 import { registerClientHandlers } from "./handlers/client.js";
+import { clientsStore, metaStore, modelRequestsStore } from "./data/store.js";
+import { formatWeeklyAdminSummary } from "./stats.js";
+import { getAdminIds } from "./helpers.js";
 import { logger } from "./lib/logger.js";
 
 const token = process.env["BOT_TOKEN"] || process.env["TELEGRAM_BOT_TOKEN"];
@@ -33,6 +36,37 @@ bot.catch((err, ctx) => {
 
 registerAdminHandlers(bot);
 registerClientHandlers(bot);
+
+// ── Haftalik avtomatik xulosa (dushanba, 09:00 Toshkent vaqti) ───────────────
+// Yagona maqsadli, minimal scheduler — boshqa hech qanday background vazifa
+// (AI, so'rovnoma, review) yo'q. 15 daqiqada bir tekshiradi; shu hafta
+// allaqachon yuborilgan bo'lsa (metaStore orqali), qayta yubormaydi — qayta
+// deploy/restart bo'lganda ham dublikat bo'lmaydi.
+const WEEKLY_SUMMARY_CHECK_MS = 15 * 60 * 1000;
+const TASHKENT_OFFSET_MS = 5 * 60 * 60 * 1000;
+
+function checkWeeklySummary(): void {
+  const nowTashkent = new Date(Date.now() + TASHKENT_OFFSET_MS);
+  const isMonday = nowTashkent.getUTCDay() === 1;
+  if (!isMonday || nowTashkent.getUTCHours() !== 9) return;
+
+  const todayStr = nowTashkent.toISOString().slice(0, 10);
+  if (metaStore.getLastWeeklySummarySentAt()?.slice(0, 10) === todayStr) return;
+
+  const adminIds = getAdminIds();
+  if (adminIds.length === 0) return;
+
+  metaStore.setLastWeeklySummarySentAt(new Date().toISOString());
+  const text = formatWeeklyAdminSummary(clientsStore.getAll(), modelRequestsStore.getAll());
+
+  for (const adminId of adminIds) {
+    bot.telegram.sendMessage(adminId, text).catch((err) => {
+      logger.error({ err, adminId }, "Haftalik xulosa yuborilmadi");
+    });
+  }
+}
+
+setInterval(checkWeeklySummary, WEEKLY_SUMMARY_CHECK_MS);
 
 logger.info("Bot ishga tushirilmoqda — Telegram API bilan bog'lanish tekshirilmoqda...");
 

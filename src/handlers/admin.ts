@@ -3,10 +3,18 @@ import type { BotContext } from "../types.js";
 import { clientsStore, modelRequestsStore, modelsStore, type CameraModel } from "../data/store.js";
 import { isAdmin } from "../helpers.js";
 import {
+  formatBusiestDay,
+  formatCoverageRate,
   formatGeneralStats,
+  formatHopelessClients,
+  formatHourlyActivity,
   formatMissingModelsRanking,
   formatModelRanking,
   formatNewClientsStats,
+  formatReturningRate,
+  formatSilentStarters,
+  formatWeekdayActivity,
+  formatWeeklyNewClientsTrend,
 } from "../stats.js";
 
 type AdminState =
@@ -168,6 +176,76 @@ export function registerAdminHandlers(bot: Telegraf<BotContext>): void {
     await ctx.reply(text, Markup.inlineKeyboard([[Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")]]));
   });
 
+  // ── Faollik statistikasi ──
+  bot.action("admin_stats_activity_menu", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await ctx.editMessageText("Faollik statistikasi:", buildActivityStatsMenu());
+  });
+
+  bot.action("admin_stats_hourly", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatHourlyActivity(modelRequestsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([[Markup.button.callback("⬅️ Orqaga", "admin_stats_activity_menu")]]));
+  });
+
+  bot.action("admin_stats_weekday", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatWeekdayActivity(modelRequestsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([[Markup.button.callback("⬅️ Orqaga", "admin_stats_activity_menu")]]));
+  });
+
+  bot.action("admin_stats_busiest_day", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatBusiestDay(modelRequestsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([[Markup.button.callback("⬅️ Orqaga", "admin_stats_activity_menu")]]));
+  });
+
+  // ── Mijozlar statistikasi ──
+  bot.action("admin_stats_customers_menu", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    await ctx.editMessageText("Mijozlar statistikasi:", buildCustomerStatsMenu());
+  });
+
+  bot.action("admin_stats_weekly_trend", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatWeeklyNewClientsTrend(clientsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([[Markup.button.callback("⬅️ Orqaga", "admin_stats_customers_menu")]]));
+  });
+
+  bot.action("admin_stats_returning", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatReturningRate(modelRequestsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([[Markup.button.callback("⬅️ Orqaga", "admin_stats_customers_menu")]]));
+  });
+
+  bot.action("admin_stats_coverage", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatCoverageRate(modelRequestsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([[Markup.button.callback("⬅️ Orqaga", "admin_stats_customers_menu")]]));
+  });
+
+  bot.action("admin_stats_hopeless", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatHopelessClients(modelRequestsStore.getAll(), clientsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([[Markup.button.callback("⬅️ Orqaga", "admin_stats_customers_menu")]]));
+  });
+
+  bot.action("admin_stats_silent", async (ctx) => {
+    if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    await ctx.answerCbQuery();
+    const text = formatSilentStarters(clientsStore.getAll(), modelRequestsStore.getAll());
+    await ctx.reply(text, Markup.inlineKeyboard([[Markup.button.callback("⬅️ Orqaga", "admin_stats_customers_menu")]]));
+  });
+
   // ── Matn/media orqali FSM qadamlarini qayta ishlash ──
   bot.on("message", async (ctx, next) => {
     if (!ctx.from || !isAdmin(ctx.from.id)) return next();
@@ -291,7 +369,29 @@ function buildStatsMenu() {
     [Markup.button.callback("Eng ko'p so'ralgan modellar", "admin_stats_models")],
     [Markup.button.callback("Bazada yo'q modellar", "admin_stats_missing_models")],
     [Markup.button.callback("Yangi mijozlar (kunlik/haftalik)", "admin_stats_new_clients")],
+    [Markup.button.callback("Faollik statistikasi ➜", "admin_stats_activity_menu"),
+     Markup.button.callback("Mijozlar statistikasi ➜", "admin_stats_customers_menu")],
     [Markup.button.callback("⬅️ Asosiy menyu", "admin_back_main")],
+  ]);
+}
+
+function buildActivityStatsMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Soat bo'yicha faollik xaritasi", "admin_stats_hourly")],
+    [Markup.button.callback("Hafta kuni bo'yicha faollik", "admin_stats_weekday")],
+    [Markup.button.callback("Eng band kun (rekord)", "admin_stats_busiest_day")],
+    [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
+  ]);
+}
+
+function buildCustomerStatsMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Haftalik yangi mijozlar dinamikasi", "admin_stats_weekly_trend")],
+    [Markup.button.callback("Qaytgan mijozlar foizi", "admin_stats_returning"),
+     Markup.button.callback("Model qamrov foizi", "admin_stats_coverage")],
+    [Markup.button.callback("\"Umidsiz\" mijozlar ro'yxati", "admin_stats_hopeless")],
+    [Markup.button.callback("/start bosib-u yozmaganlar", "admin_stats_silent")],
+    [Markup.button.callback("⬅️ Statistikaga qaytish", "admin_stats")],
   ]);
 }
 

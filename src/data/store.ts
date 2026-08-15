@@ -45,6 +45,7 @@ interface DbShape {
   models: CameraModel[];
   clients: ClientData[];
   modelRequests: ModelRequestEntry[];
+  lastWeeklySummarySentAt?: string;
 }
 
 function emptyDb(): DbShape {
@@ -60,6 +61,7 @@ function loadDb(): DbShape {
         models: parsed.models ?? [],
         clients: parsed.clients ?? [],
         modelRequests: parsed.modelRequests ?? [],
+        lastWeeklySummarySentAt: parsed.lastWeeklySummarySentAt,
       };
     } catch (err) {
       logger.error({ err, DATA_FILE }, "data.json o'qib bo'lmadi (buzilgan JSON?) — bo'sh baza bilan boshlanadi");
@@ -120,6 +122,19 @@ export const modelRequestsStore = {
   },
   record(requestedText: string, chatId: string, foundInDb: boolean, matchedModelName?: string): void {
     db.modelRequests.push({ chatId, requestedText, foundInDb, matchedModelName, requestedAt: new Date().toISOString() });
+    persist();
+  },
+};
+
+// Haftalik admin xulosasi bir haftada faqat bir marta yuborilishini
+// nazorat qilish uchun (qayta deploy/restart bo'lganda ham dublikat
+// yuborilmasin).
+export const metaStore = {
+  getLastWeeklySummarySentAt(): string | undefined {
+    return db.lastWeeklySummarySentAt;
+  },
+  setLastWeeklySummarySentAt(iso: string): void {
+    db.lastWeeklySummarySentAt = iso;
     persist();
   },
 };
